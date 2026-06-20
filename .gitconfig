@@ -1,0 +1,19 @@
+[user]
+	name = v
+	email = AlexIllinois@163.com
+[init]
+	defaultBranch = main
+[push]
+	default = current
+[pull]
+	rebase = false
+[advice]
+	addIgnoredFile = false
+[http]
+	version = HTTP/1.1
+[core]
+	compression = 1
+[safe]
+	directory = *
+[url "git@github.com:"]
+	insteadOf = http://github.com/
