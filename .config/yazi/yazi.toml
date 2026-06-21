@@ -1,0 +1,15 @@
+[mgr]
+sort_by = "alphabetical"      # 排序方式
+sort_sensitive = false        # 大小写敏感
+sort_reverse = false          # 反向排序
+sort_dir_first = true         # 目录优先
+scrolloff = 5                 # 滚动边距
+show_hidden = true
+show_symlink = true
+
+
+[opener]
+# 文件打开器配置
+edit = [
+    { run = 'nvim "$@"', block = true, desc = "nvim" },
+]
