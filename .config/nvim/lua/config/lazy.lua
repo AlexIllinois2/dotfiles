@@ -31,6 +31,12 @@ require("lazy").setup({
     -- version = "*", -- try installing the latest stable version for plugins that support semver
   },
   install = { colorscheme = { "tokyonight", "habamax" } },
+  timeout = 600000,
+  git = {
+    filter = "blob:none",
+    timeout = 600000,
+    depth = 1,
+  },
   checker = {
     enabled = true, -- check for plugin updates periodically
     notify = false, -- notify on update
