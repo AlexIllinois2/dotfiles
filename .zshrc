@@ -45,6 +45,14 @@ fi
 bindkey '^[[A' up-line-or-beginning-search
 bindkey '^[[B' down-line-or-beginning-search
 
+# 启用自动补全系统（如果文件中已有，请确保只保留一份，且带有 -u 参数以避免权限警告）
+autoload -Uz compinit && compinit -u
+# 配置补全样式：不区分大小写
+# 'm:{a-zA-Z}={A-Za-z}' 表示将小写映射为大写，大写映射为小写，实现双向忽略
+# 'r:|[._-]=* r:|=*' 等后续参数用于增强模糊匹配的灵活性
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|[._-]=* r:|=*' 'l:|=* r:|=*'
+
+
 # 自定义 widget：清屏 + 清空滚动缓冲区（保留命令历史, 但输出永久消失）
 clear-screen-and-scrollback() {
   # 1. 清可见屏 + 清滚动区（核心）
