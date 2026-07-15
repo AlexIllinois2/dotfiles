@@ -8,9 +8,13 @@ local opt = vim.opt
 opt.guicursor = "n:block-Cursor,i:block-Cursor,v:block-Cursor"
 vim.cmd("highlight Cursor guibg=#d03030 guifg=#ffffff")
 
-
 -- 关闭拼写检查，去除中文下的波浪线
 opt.spelllang = {}
+
+-- 控制鼠标/触摸板每次滚动行数
+-- 格式: mousescroll=vert:N,hor:N
+-- ver=1：垂直每次1行；hor=1：水平每次1列
+opt.mousescroll = "ver:3,hor:3"
 
 -- 使用系统剪贴板
 opt.clipboard = "unnamedplus"
