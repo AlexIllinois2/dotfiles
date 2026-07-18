@@ -14,7 +14,7 @@ mp4() {
   mpv --shuffle --sub-auto=no --border=no --geometry=100%:0 --autofit=20% --ontop-level=system --ontop "$MV_DIR"
 }
 
-case $1 in
-    v) mp4 ;;
+case $(basename "$0") in
+    mp4) mp4 ;;
     *) mp3 ;;
 esac
