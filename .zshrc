@@ -72,7 +72,7 @@ find $HOME/.local/shell/env -mindepth 1 | while read line; do source "$line"; do
 find $HOME/.local/shell/rc -mindepth 1 | while read line; do source "$line"; done
 unset line
 
-alias note='nvim --cmd "cd ~/asset/i/note"'
+alias note='nvim --cmd "cd ~/archive"'
 
 # opencode
 export PATH=/home/v/.opencode/bin:$PATH
