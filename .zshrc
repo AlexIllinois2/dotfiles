@@ -73,6 +73,7 @@ find $HOME/.local/shell/rc -mindepth 1 | while read line; do source "$line"; don
 unset line
 
 alias note='nvim --cmd "cd ~/archive"'
+alias noproxy='unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy'
 
 # opencode
 export PATH=/home/v/.opencode/bin:$PATH
