@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>视频精准抽帧工具</title>
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --accent-color: #ff4d4f;
+            --bg-color: #f0f2f5;
+        }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            padding: 20px; 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background-color: var(--bg-color); 
+            color: #333;
+        }
+
+        .container { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1); 
+        }
+
+        h2 { margin-top: 0; color: #333; text-align: center; }
+
+        /* 控制区 */
+        .controls { 
+            margin-bottom: 20px; 
+            padding: 15px; 
+            background: #fafafa; 
+            border-radius: 8px; 
+            border: 1px solid #eee; 
+        }
+
+        .control-group { margin-bottom: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        
+        label { font-weight: 600; font-size: 14px; color: #555; }
+        input[type="number"], input[type="file"] { padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        
+        /* 视频容器 */
+        .video-wrapper { 
+            position: relative; 
+            display: inline-block; 
+            width: 100%;
+            overflow: hidden;
+            border-radius: 8px;
+            background: #000;
+            touch-action: none; /* 禁止默认触摸行为 */
+        }
+
+        video { width: 100%; display: block; opacity: 0.9; }
+
+        /* 覆盖层：用于显示预览框（未确认） */
+        .preview-overlay {
+            position: absolute;
+            top: 0; left: 0;
+            width: 0; height: 0; /* 初始隐藏 */
+            border: 2px dashed var(--primary-color);
+            box-sizing: border-box;
+            pointer-events: none;
+            transition: all 0.1s ease-out;
+            background: rgba(0, 123, 255, 0.1);
+            z-index: 10;
+        }
+
+        /* 覆盖层：用于显示确认后的选区 */
+        .selection-overlay {
+            position: absolute;
+            top: 0; left: 0;
+            width: 0; height: 0;
+            border: 2px solid var(--accent-color);
+            box-sizing: border-box;
+            pointer-events: none;
+            background: rgba(255, 77, 79, 0.1);
+            z-index: 11;
+        }
+
+        .status-hint {
+            text-align: center;
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+            height: 20px;
+        }
+
+        /* 结果输出 */
+        .result-area { margin-top: 20px; }
+        textarea { width: 100%; height: 70px; font-family: monospace; padding: 10px; box-sizing: border-box; background: #f8f9fa; border: 1px solid #ddd; border-radius: 6px; resize: vertical; }
+        
+        button { background: var(--primary-color); color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #0056b3; }
+
+        @media (max-width: 600px) {
+            .magnifier-float { width: 240px; height: 240px; bottom: 10px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🎬 视频抽帧与裁剪工具</h2>
+
+    <!-- 控制区 -->
+    <div class="controls">
+        <div class="control-group">
+            <label for="videoInput">1. 上传视频:</label>
+            <input type="file" id="videoInput" accept="video/*">
+        </div>
+        
+        <div class="control-group">
+            <label for="timeInput">2. 截取时间 (秒):</label>
+            <input type="number" id="timeInput" value="0" step="0.1" min="0">
+            <button onclick="loadFrame()">加载画面</button>
+        </div>
+
+        <div class="control-group">
+            <label>3. 剪裁模式:</label>
+            <select id="cropModeSelect" style="padding: 5px;">
+                <option value="vertical">仅上下剪裁</option>
+                <option value="horizontal">仅左右剪裁</option>
+                <option value="normal">正常剪裁</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>4. 选点模式:</label>
+            <select id="modeSelect" style="padding: 5px;">
+                <option value="start">起点 (左上角)</option>
+                <option value="end">终点 (右下角)</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label for="filePathInput">5. 文件目录:</label>
+            <input type="text" id="filePathInput" placeholder="例如: /home/videos 或 D:\Videos" style="flex: 1;">
+        </div>
+    </div>
+
+    <!-- 视频显示区 -->
+    <div id="videoContainer" class="video-wrapper" style="display:none;">
+        <video id="mainVideo" muted playsinline></video>
+        <!-- 实时预览框 -->
+        <div id="previewBox" class="preview-overlay"></div>
+        <!-- 确认选区框 -->
+        <div id="selectionBox" class="selection-overlay"></div>
+    </div>
+    
+    <div id="statusHint" class="status-hint">提示：点击画面设定坐标</div>
+
+    <!-- 结果输出 -->
+    <div class="result-area">
+        <p>
+            <strong>当前尺寸:</strong> <span id="dimDisplay">宽: 0, 高: 0</span> | 
+            <strong>选区:</strong> (<span id="x1Display">0</span>, <span id="y1Display">0</span>) -> (<span id="x2Display">0</span>, <span id="y2Display">0</span>)
+        </p>
+        <label>FFmpeg 裁剪命令:</label>
+        <div style="display: flex; gap: 8px; align-items: flex-start;">
+            <textarea id="cmdOutput" readonly style="flex: 1;"></textarea>
+            <button onclick="copyCommand()" style="white-space: nowrap; height: 70px;">📋 复制命令</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    // 状态变量
+    let x1 = 0, y1 = 0, x2 = 0, y2 = 0; // 真实分辨率坐标
+    let videoWidth = 0, videoHeight = 0;
+    let currentMode = 'start'; // 'start' or 'end'
+    let cropMode = 'vertical'; // 'vertical', 'horizontal', 'normal'
+    let videoFileName = ''; // 视频文件名
+    
+    // DOM 元素
+    const videoInput = document.getElementById('videoInput');
+    const timeInput = document.getElementById('timeInput');
+    const filePathInput = document.getElementById('filePathInput');
+    const videoEl = document.getElementById('mainVideo');
+    const containerEl = document.getElementById('videoContainer');
+    const previewBox = document.getElementById('previewBox');
+    const selectionBox = document.getElementById('selectionBox');
+    const statusHint = document.getElementById('statusHint');
+    const modeSelect = document.getElementById('modeSelect');
+    const cropModeSelect = document.getElementById('cropModeSelect');
+
+    // 监听模式切换
+    modeSelect.addEventListener('change', (e) => {
+        currentMode = e.target.value;
+        updateStatusHint();
+        // 切换选点模式时，重新渲染UI以显示当前选区
+        if (videoWidth > 0) {
+            updateUI(0, 0, true);
+        }
+    });
+
+    // 监听剪裁模式切换
+    cropModeSelect.addEventListener('change', (e) => {
+        cropMode = e.target.value;
+        // 切换模式时重置坐标
+        if (videoWidth > 0) {
+            resetCoordinates();
+            updateUI(0, 0, true);
+        }
+        updateStatusHint();
+    });
+
+    // 监听文件目录变化，重新生成命令
+    filePathInput.addEventListener('input', () => {
+        if (videoWidth > 0) {
+            generateCommand(x1, y1, x2 - x1, y2 - y1);
+        }
+    });
+
+    function updateStatusHint() {
+        let modeText = '';
+        if (cropMode === 'vertical') {
+            modeText = '【仅上下剪裁】左右不剪裁';
+        } else if (cropMode === 'horizontal') {
+            modeText = '【仅左右剪裁】上下不剪裁';
+        } else {
+            modeText = '【正常剪裁】';
+        }
+        
+        const pointText = currentMode === 'start' ? "设置左上角" : "设置右下角";
+        statusHint.innerText = `${modeText} - ${pointText}。点击画面确认。`;
+    }
+
+    // 页面加载时清除所有状态
+    window.addEventListener('load', () => {
+        // 清除视频输入框
+        videoInput.value = '';
+        videoFileName = '';
+        
+        // 清除文件目录输入框
+        filePathInput.value = '';
+        
+        // 重置选点模式为起点
+        currentMode = 'start';
+        modeSelect.value = 'start';
+        
+        // 重置剪裁模式为仅上下剪裁
+        cropMode = 'vertical';
+        cropModeSelect.value = 'vertical';
+        
+        // 重置坐标
+        x1 = 0; y1 = 0; x2 = 0; y2 = 0;
+        videoWidth = 0; videoHeight = 0;
+        
+        // 清空命令输出框
+        document.getElementById('cmdOutput').value = '';
+        
+        // 更新显示
+        document.getElementById('x1Display').innerText = '0';
+        document.getElementById('y1Display').innerText = '0';
+        document.getElementById('x2Display').innerText = '0';
+        document.getElementById('y2Display').innerText = '0';
+        document.getElementById('dimDisplay').innerText = '宽: 0, 高: 0';
+        
+        // 隐藏视频容器和覆盖层
+        containerEl.style.display = 'none';
+        previewBox.style.display = 'none';
+        selectionBox.style.display = 'none';
+        
+        // 更新状态提示
+        updateStatusHint();
+    });
+
+    // 初始化视频
+    videoInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        // 保存视频文件名（不含扩展名）
+        videoFileName = file.name.replace(/\.[^/.]+$/, "");
+        
+        const url = URL.createObjectURL(file);
+        videoEl.src = url;
+        containerEl.style.display = 'block';
+        
+        videoEl.onloadedmetadata = () => {
+            videoWidth = videoEl.videoWidth;
+            videoHeight = videoEl.videoHeight;
+            
+            // 重置数据，根据剪裁模式设置默认值
+            resetCoordinates();
+            updateUI(0, 0, true);
+            loadFrame();
+        };
+    });
+
+    // 重置坐标
+    function resetCoordinates() {
+        if (cropMode === 'vertical') {
+            // 仅上下剪裁：左右不剪裁，x1=0, x2=videoWidth
+            x1 = 0;
+            y1 = 0;
+            x2 = videoWidth;
+            y2 = videoHeight;
+        } else if (cropMode === 'horizontal') {
+            // 仅左右剪裁：上下不剪裁，y1=0, y2=videoHeight
+            x1 = 0;
+            y1 = 0;
+            x2 = videoWidth;
+            y2 = videoHeight;
+        } else {
+            // 正常剪裁
+            x1 = 0;
+            y1 = 0;
+            x2 = videoWidth;
+            y2 = videoHeight;
+        }
+    }
+
+    // --- 核心功能函数 ---
+
+    // 加载指定时间的画面
+    function loadFrame() {
+        if (!videoEl.src) return;
+        const time = parseFloat(timeInput.value);
+        videoEl.currentTime = time;
+        videoEl.pause();
+    }
+
+    videoEl.addEventListener('seeked', drawToCanvas);
+
+    // 将当前帧绘制到 Canvas（保留以备将来使用）
+    function drawToCanvas() {
+        if (!videoWidth) return;
+        const canvas = document.createElement('canvas');
+        canvas.width = videoWidth;
+        canvas.height = videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(videoEl, 0, 0, videoWidth, videoHeight);
+    }
+
+    // 获取鼠标/触摸点在视频原始分辨率中的坐标
+    function getRealCoordinates(clientX, clientY) {
+        const rect = videoEl.getBoundingClientRect();
+        let mouseX = clientX - rect.left;
+        let mouseY = clientY - rect.top;
+
+        // 边界检查
+        if (mouseX < 0) mouseX = 0;
+        if (mouseY < 0) mouseY = 0;
+        if (mouseX > rect.width) mouseX = rect.width;
+        if (mouseY > rect.height) mouseY = rect.height;
+
+        const scaleX = videoWidth / rect.width;
+        const scaleY = videoHeight / rect.height;
+        
+        return {
+            x: Math.floor(mouseX * scaleX),
+            y: Math.floor(mouseY * scaleY)
+        };
+    }
+
+    // 更新界面显示（包括预览框和最终命令）
+    function updateUI(realX, realY, isConfirmed) {
+        const rect = videoEl.getBoundingClientRect();
+        const scaleX = rect.width / videoWidth;
+        const scaleY = rect.height / videoHeight;
+
+        let tempX1 = x1, tempY1 = y1, tempX2 = x2, tempY2 = y2;
+
+        // 如果是预览状态（未确认），只改变临时变量
+        if (!isConfirmed) {
+            if (currentMode === 'start') {
+                if (cropMode === 'vertical') {
+                    // 仅上下剪裁：只修改y坐标
+                    tempY1 = realY;
+                } else if (cropMode === 'horizontal') {
+                    // 仅左右剪裁：只修改x坐标
+                    tempX1 = realX;
+                } else {
+                    // 正常剪裁：修改x和y坐标
+                    tempX1 = realX;
+                    tempY1 = realY;
+                }
+            } else {
+                if (cropMode === 'vertical') {
+                    // 仅上下剪裁：只修改y坐标
+                    tempY2 = realY;
+                } else if (cropMode === 'horizontal') {
+                    // 仅左右剪裁：只修改x坐标
+                    tempX2 = realX;
+                } else {
+                    // 正常剪裁：修改x和y坐标
+                    tempX2 = realX;
+                    tempY2 = realY;
+                }
+            }
+        }
+
+        // 计算宽高
+        const w = tempX2 - tempX1;
+        const h = tempY2 - tempY1;
+
+        // 更新文字显示
+        document.getElementById('dimDisplay').innerText = `宽: ${videoWidth}, 高: ${videoHeight}`;
+        document.getElementById('x1Display').innerText = tempX1;
+        document.getElementById('y1Display').innerText = tempY1;
+        document.getElementById('x2Display').innerText = tempX2;
+        document.getElementById('y2Display').innerText = tempY2;
+
+        // 更新视觉覆盖层
+        // 更新预览框 (虚线)
+        previewBox.style.display = 'block';
+        previewBox.style.left = `${tempX1 * scaleX}px`;
+        previewBox.style.top = `${tempY1 * scaleY}px`;
+        previewBox.style.width = `${w * scaleX}px`;
+        previewBox.style.height = `${h * scaleY}px`;
+
+        // 如果已确认，更新实线框
+        if (isConfirmed) {
+            selectionBox.style.display = 'block';
+            selectionBox.style.left = `${x1 * scaleX}px`;
+            selectionBox.style.top = `${y1 * scaleY}px`;
+            selectionBox.style.width = `${(x2 - x1) * scaleX}px`;
+            selectionBox.style.height = `${(y2 - y1) * scaleY}px`;
+            
+            generateCommand(x1, y1, x2-x1, y2-y1);
+        }
+    }
+
+    function generateCommand(x, y, w, h) {
+        const timeVal = timeInput.value;
+        const date = new Date(0);
+        date.setSeconds(parseFloat(timeVal));
+        const timeStr = date.toISOString().substr(11, 12); 
+        
+        // 获取文件目录
+        const filePath = filePathInput.value.trim();
+        
+        // 构建输入文件名（带路径）
+        let inputName;
+        if (filePath) {
+            // 判断路径分隔符，自动适配Windows和Unix
+            const separator = filePath.includes('\\') ? '\\' : '/';
+            // 确保路径末尾有分隔符
+            const normalizedPath = filePath.endsWith(separator) ? filePath : filePath + separator;
+            inputName = `"${normalizedPath}${videoFileName}.mp4"`;
+        } else {
+            // 没有路径时只用文件名
+            inputName = `"${videoFileName}.mp4"`;
+        }
+        
+        // 输出文件名（不加路径）
+        const outputName = `"${videoFileName}_crop.mp4"`;
+        
+        const cmd = `ffmpeg -ss ${timeStr} -i ${inputName} -vf "crop=${w}:${h}:${x}:${y}" -c:v libx264 -c:a copy ${outputName}`;
+        document.getElementById('cmdOutput').value = cmd;
+    }
+
+    // --- 事件监听 ---
+
+    let isTouchMoving = false; // 标记是否正在触摸移动
+
+    // 鼠标/触摸按下（简化，移除长按逻辑）
+    const startHandler = (e) => {
+        if (!videoWidth) return;
+        e.preventDefault(); // 防止选中文本
+        isTouchMoving = false; // 重置移动标记
+    };
+
+    // 鼠标/触摸移动（简化，只更新预览框）
+    const moveHandler = (e) => {
+        if (!videoWidth) return;
+        e.preventDefault();
+        isTouchMoving = true; // 标记为正在移动
+
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const coords = getRealCoordinates(clientX, clientY);
+
+        // 更新预览框
+        updateUI(coords.x, coords.y, false);
+    };
+
+    // 触摸结束处理（移动端选点）
+    const touchEndHandler = (e) => {
+        if (!videoWidth) return;
+        
+        // 获取最后的触摸位置（需要使用changedTouches）
+        const touch = e.changedTouches ? e.changedTouches[0] : null;
+        if (touch) {
+            const coords = getRealCoordinates(touch.clientX, touch.clientY);
+            
+            // 确认选点，根据剪裁模式限制修改的坐标
+            if (currentMode === 'start') {
+                if (cropMode === 'vertical') {
+                    y1 = coords.y;
+                } else if (cropMode === 'horizontal') {
+                    x1 = coords.x;
+                } else {
+                    x1 = coords.x;
+                    y1 = coords.y;
+                }
+            } else {
+                if (cropMode === 'vertical') {
+                    y2 = coords.y;
+                } else if (cropMode === 'horizontal') {
+                    x2 = coords.x;
+                } else {
+                    x2 = coords.x;
+                    y2 = coords.y;
+                }
+            }
+            
+            updateUI(coords.x, coords.y, true);
+            statusHint.innerText = "触摸选点完成。";
+        }
+        
+        isTouchMoving = false; // 重置移动标记
+    };
+
+    // 点击处理（PC端选点）
+    const clickHandler = (e) => {
+        if (!videoWidth) return;
+
+        const clientX = e.clientX;
+        const clientY = e.clientY;
+        const coords = getRealCoordinates(clientX, clientY);
+
+        // 直接确认选点，根据剪裁模式限制修改的坐标
+        if (currentMode === 'start') {
+            if (cropMode === 'vertical') {
+                y1 = coords.y;
+            } else if (cropMode === 'horizontal') {
+                x1 = coords.x;
+            } else {
+                x1 = coords.x;
+                y1 = coords.y;
+            }
+        } else {
+            if (cropMode === 'vertical') {
+                y2 = coords.y;
+            } else if (cropMode === 'horizontal') {
+                x2 = coords.x;
+            } else {
+                x2 = coords.x;
+                y2 = coords.y;
+            }
+        }
+        
+        updateUI(coords.x, coords.y, true);
+        statusHint.innerText = "点击选点完成。";
+    };
+
+    // 绑定事件（移动端优先，避免事件冲突）
+    videoEl.addEventListener('touchstart', startHandler, { passive: false });
+    videoEl.addEventListener('touchmove', moveHandler, { passive: false });
+    videoEl.addEventListener('touchend', touchEndHandler);
+    
+    videoEl.addEventListener('mousedown', startHandler);
+    videoEl.addEventListener('mousemove', moveHandler);
+    videoEl.addEventListener('click', clickHandler);
+
+    // 复制命令到剪贴板
+    function copyCommand() {
+        const cmdOutput = document.getElementById('cmdOutput');
+        const cmdText = cmdOutput.value;
+        
+        if (!cmdText) {
+            statusHint.innerText = '没有可复制的命令';
+            return;
+        }
+        
+        // 使用现代 Clipboard API
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(cmdText).then(() => {
+                statusHint.innerText = '✅ 命令已复制到剪贴板';
+                setTimeout(() => updateStatusHint(), 2000);
+            }).catch(err => {
+                console.error('复制失败:', err);
+                fallbackCopy(cmdText);
+            });
+        } else {
+            // 降级方案
+            fallbackCopy(cmdText);
+        }
+    }
+    
+    // 降级复制方法
+    function fallbackCopy(text) {
+        const cmdOutput = document.getElementById('cmdOutput');
+        cmdOutput.select();
+        cmdOutput.setSelectionRange(0, 99999); // 适配移动端
+        
+        try {
+            document.execCommand('copy');
+            statusHint.innerText = '✅ 命令已复制到剪贴板';
+            setTimeout(() => updateStatusHint(), 2000);
+        } catch (err) {
+            statusHint.innerText = '❌ 复制失败，请手动复制';
+            setTimeout(() => updateStatusHint(), 2000);
+        }
+    }
+
+</script>
+</body>
+</html>
