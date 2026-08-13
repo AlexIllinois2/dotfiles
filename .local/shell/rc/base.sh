@@ -24,3 +24,7 @@ export EDITOR="vim"
 alias v="vim"
 alias nano="vim"
 
+alias y="yadm"
+
+alias noproxy='unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy'
+
