@@ -67,6 +67,9 @@ zle -N clear-screen-and-scrollback
 bindkey '^L' clear-screen-and-scrollback
 
 
+
+export _ZO_DOCTOR=0
+
 # ---------- 自定义可加载的脚本 ----------
 find $HOME/.local/shell/env -mindepth 1 | while read line; do source "$line"; done
 find $HOME/.local/shell/rc -mindepth 1 | while read line; do source "$line"; done
