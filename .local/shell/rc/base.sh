@@ -19,6 +19,8 @@ export EDITOR="vim"
 alias v="vim"
 alias nano="vim"
 
+alias dl='aria2c -x 8 -s 8 -c --file-allocation=none -d ~/Downloads'
+
 alias y="yadm"
 
 alias noproxy='unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy'
