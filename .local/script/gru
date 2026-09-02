@@ -4,7 +4,7 @@
 """
 gru.py - 批量拉取多个本地 Git 仓库
 用法: python gru.py
-配置: 修改下面的 REPOS 列表，填入你的仓库路径（支持 ~ 和 $HOME 等环境变量）
+配置: 修改下面的 REPOS 列表，填入本地路径和远程链接（支持 ~ 和 $HOME 等环境变量）
 """
 
 import os
@@ -14,8 +14,12 @@ from pathlib import Path
 
 # ---------- 在这里配置你要管理的 Git 仓库路径 ----------
 REPOS = [
-    "~/.local/project/minion",
-    "$HOME/.local/share/fcitx5/rime",
+    ("~/.local/project/minion", "git@github.com:Sentdex/minion.git"),
+    ("$HOME/.local/share/fcitx5/rime", "git@github.com:iDvel/rime-ice.git"),
+    ("$HOME/.local/share/zsh/plugins/zsh-completions.git", "git@github.com:zsh-users/zsh-completions.git"),
+    ("$HOME/.local/share/zsh/plugins/fzf-tab.git", "git@github.com:Aloxaf/fzf-tab.git"),
+    ("$HOME/.local/share/zsh/themes/powerlevel10k.git", "git@github.com:romkatv/powerlevel10k.git"),
+    
     # 添加更多仓库...
 ]
 # -----------------------------------------------------
@@ -28,6 +32,28 @@ def expand_path(path_str: str) -> Path:
 def is_git_repo(path: Path) -> bool:
     """检查路径是否是一个有效的 Git 仓库"""
     return (path / ".git").exists()
+
+def git_clone(repo_path: Path, remote_url: str) -> bool:
+    """克隆缺失的仓库，仅获取最新提交。"""
+    try:
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"\n>>> 正在克隆: {remote_url} -> {repo_path}")
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", remote_url, str(repo_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            print("✅ 克隆成功")
+            return True
+        print("❌ 克隆失败:")
+        if result.stderr:
+            print(result.stderr.strip(), file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"❌ 执行 git clone 时发生异常: {e}")
+        return False
 
 def git_pull(repo_path: Path) -> bool:
     """
@@ -65,37 +91,35 @@ def git_pull(repo_path: Path) -> bool:
         return False
 
 def main():
-    # 解析并展开所有路径
-    expanded_paths = [expand_path(p) for p in REPOS]
-
-    # 过滤出存在的目录
-    valid_paths = []
-    for p in expanded_paths:
-        if not p.exists():
-            print(f"⚠️  路径不存在，已跳过: {p}")
-            continue
-        if not p.is_dir():
-            print(f"⚠️  不是目录，已跳过: {p}")
-            continue
-        valid_paths.append(p)
-
-    if not valid_paths:
-        print("没有可用的仓库路径，请检查 REPOS 配置。")
-        sys.exit(1)
-
-    print(f"共 {len(valid_paths)} 个仓库待拉取")
     success_count = 0
     failure_count = 0
 
-    for repo in valid_paths:
+    for local_path, remote_url in REPOS:
+        repo = expand_path(local_path)
+        if not repo.exists():
+            if git_clone(repo, remote_url):
+                success_count += 1
+            else:
+                failure_count += 1
+            continue
+        if not repo.is_dir():
+            print(f"⚠️  不是目录，已跳过: {repo}")
+            failure_count += 1
+            continue
         if not is_git_repo(repo):
             print(f"⚠️  不是 Git 仓库（缺少 .git），已跳过: {repo}")
+            failure_count += 1
             continue
         if git_pull(repo):
             success_count += 1
         else:
             failure_count += 1
 
+    if not REPOS:
+        print("没有配置仓库，请检查 REPOS 配置。")
+        sys.exit(1)
+
+    print(f"共 {len(REPOS)} 个仓库处理完成")
     # 汇总结果
     print("\n" + "=" * 50)
     print(f"完成: 成功 {success_count} 个，失败 {failure_count} 个")
