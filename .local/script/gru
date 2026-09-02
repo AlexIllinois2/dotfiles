@@ -14,8 +14,7 @@ from pathlib import Path
 
 # ---------- 在这里配置你要管理的 Git 仓库路径 ----------
 REPOS = [
-    ("~/.local/project/minion", "git@github.com:Sentdex/minion.git"),
-    ("$HOME/.local/share/fcitx5/rime", "git@github.com:iDvel/rime-ice.git"),
+    ("~/.local/share/fcitx5/rime", "git@github.com:iDvel/rime-ice.git"),
     ("$HOME/.local/share/zsh/plugins/zsh-completions.git", "git@github.com:zsh-users/zsh-completions.git"),
     ("$HOME/.local/share/zsh/plugins/fzf-tab.git", "git@github.com:Aloxaf/fzf-tab.git"),
     ("$HOME/.local/share/zsh/themes/powerlevel10k.git", "git@github.com:romkatv/powerlevel10k.git"),
