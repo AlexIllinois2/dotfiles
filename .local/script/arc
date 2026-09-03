@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+arc.py —— 自动压缩 / 解压脚本 (需 Python 3.8+)
+
+用法:
+    arc.py [-l/--list] [-i/--input] <输入路径> [-o/--output <输出路径>]
+           [-c/--compress-level <压缩率>]
+    arc.py -h/--help
+
+参数:
+    -i, --input      <输入路径>   输入路径 (也可省略参数名, 直接写位置参数)
+    -o, --output     <输出路径>   输出路径 (压缩=输出文件, 解压=输出目录)
+    -l, --list                    仅列出压缩包内容, 不做解压
+    -c, --compress-level <压缩率> 0~9 或别名(存储/最快/快速/标准/最大),
+                                  默认 3 (快速压缩)
+    -h, --help                    显示帮助
+    (兼容旧版中文别名: -输入 / -输出 / -仅查看 / -压缩率)
+
+规则:
+    * 自动判断方向: 输入是目录、或不带可识别压缩后缀的文件 => 压缩;
+                     输入是可识别的压缩包(后缀或文件头)     => 解压。
+    * 未指定 -o 时: 压缩 => 当前目录生成 <name>.zip
+                    解压 => 解到当前目录
+    * 指定 -o 时:   压缩 => 按输出路径后缀选择格式
+                    解压 => 作为解压根目录
+    * 解压智能规则: 压缩包顶层只有唯一条目(文件或目录)时, 直接解到输出路径,
+      不额外套目录; 顶层有多个条目时, 以压缩包名在输出路径下建目录。
+    * 默认输出 debug 级日志, 逐文件显示进度。
+
+支持格式: zip / tar / tar.gz / tar.bz2 / tar.xz / gz / bz2 / xz (标准库),
+7z / rar 需系统安装 7z 或 unrar (rar 仅支持解压)。
+"""
+
+import argparse
+import bz2
+import gzip
+import logging
+import lzma
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from pathlib import Path
+
+VERSION = '1.1'
+CHUNK = 4 * 1024 * 1024          # 流式读写块大小
+DEFAULT_LEVEL = 3                # 未指定压缩率时: 快速档
+LOG = logging.getLogger('arc')
+
+
+class ArcError(Exception):
+    """业务错误: 直接展示给用户, 不打印堆栈"""
+
+
+# ---------------- 基础工具 ----------------
+
+def human_size(n):
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return '%d%s' % (n, unit) if unit == 'B' else '%.1f%s' % (n, unit)
+        n /= 1024.0
+
+
+def fmt_elapsed(sec):
+    if sec < 60:
+        return '%.2f 秒' % sec
+    return '%d 分 %.1f 秒' % (sec // 60, sec % 60)
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.DEBUG,   # 默认 debug 级: 显示详情/进度
+        format='%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+
+def tar_kind(ti):
+    if ti.isdir():
+        return '目录'
+    if ti.issym() or ti.islnk():
+        return '链接'
+    return '特殊文件'
+
+
+# ---------------- 格式识别 ----------------
+
+FORMAT_BY_SUFFIX = {
+    '.zip': 'zip', '.tar': 'tar',
+    '.tar.gz': 'tar.gz', '.tgz': 'tar.gz',
+    '.tar.bz2': 'tar.bz2', '.tbz2': 'tar.bz2', '.tbz': 'tar.bz2',
+    '.tar.xz': 'tar.xz', '.txz': 'tar.xz',
+    '.gz': 'gz', '.bz2': 'bz2', '.xz': 'xz',
+    '.7z': '7z', '.rar': 'rar',
+}
+TAR_FORMATS = ('tar', 'tar.gz', 'tar.bz2', 'tar.xz')
+SINGLE_FILE_FORMATS = ('gz', 'bz2', 'xz')
+COMPOUND_SUFFIXES = ('.tar.gz', '.tar.bz2', '.tar.xz',
+                     '.tgz', '.tbz2', '.tbz', '.txz')
+
+
+def format_from_suffix(path: Path):
+    """根据路径后缀判断压缩格式, 未知返回 None"""
+    low = path.name.lower()
+    for suf in ('.tar.gz', '.tar.bz2', '.tar.xz'):   # 先匹配复合后缀
+        if low.endswith(suf):
+            return FORMAT_BY_SUFFIX[suf]
+    return FORMAT_BY_SUFFIX.get(path.suffix.lower())
+
+
+def archive_stem(path: Path):
+    """去掉压缩后缀得到基础名: foo.tar.gz -> foo"""
+    low = path.name.lower()
+    for suf in COMPOUND_SUFFIXES:
+        if low.endswith(suf):
+            return path.name[:-len(suf)]
+    return path.stem
+
+
+def gzip_original_name(path):
+    """读取 gzip 头部 FNAME 字段中保存的原始文件名(可能没有)"""
+    try:
+        with open(path, 'rb') as f:
+            if f.read(2) != b'\x1f\x8b':
+                return None
+            flg = f.read(1)
+            if not flg:
+                return None
+            f.read(6)                      # MTIME + XFL + OS
+            if flg[0] & 0x08:              # FNAME 标志位
+                buf = bytearray()
+                while True:
+                    c = f.read(1)
+                    if not c or c == b'\x00':
+                        break
+                    buf += c
+                if buf:
+                    return buf.decode('utf-8', 'replace')
+    except OSError:
+        pass
+    return None
+
+
+def sniff_format(path: Path):
+    """后缀无法识别时, 读取文件头(魔数)判断格式"""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(265)
+    except OSError:
+        return None
+    if head[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08'):
+        return 'zip'
+    if head[:6] == b'7z\xbc\xaf\x27\x1c':
+        return '7z'
+    if head[:7] == b'Rar!\x1a\x07':
+        return 'rar'
+    if len(head) >= 262 and head[257:262] == b'ustar':
+        return 'tar'
+    for fmt, (opener, magic) in (
+            ('gz', (gzip.open, b'\x1f\x8b')),
+            ('bz2', (bz2.open, b'BZh')),
+            ('xz', (lzma.open, b'\xfd7zXZ\x00'))):
+        if head[:len(magic)] == magic:
+            # 进一步判断压缩流内是否为 tar
+            try:
+                with opener(str(path), 'rb') as f:
+                    data = f.read(265)
+                if data[257:262] == b'ustar':
+                    return 'tar.' + fmt
+            except Exception:
+                pass
+            return fmt
+    return None
+
+
+def parse_level(text):
+    """压缩率: 0~9 或别名, 返回 int"""
+    s = str(text).strip().lower()
+    digits = {str(i): i for i in range(10)}
+    aliases = {'存储': 0, 'store': 0, '最快': 1, 'fast': 1,
+               '快': 3, '快速': 3, '标准': 5, 'standard': 5,
+               '高': 7, '最大': 9, 'max': 9, 'best': 9, 'ultra': 9}
+    if s in digits:
+        return digits[s]
+    if s in aliases:
+        return aliases[s]
+    raise argparse.ArgumentTypeError(
+        '压缩率需为 0~9 的整数或别名(存储/最快/快速/标准/最大)')
+
+
+# ---------------- 通用收集/遍历 ----------------
+
+def iter_files(src: Path):
+    """返回 (绝对路径, 归档内相对名); 目录时归档根为目录名, 单文件时为文件名"""
+    if src.is_file():
+        yield src, src.name
+        return
+    for p in sorted(src.rglob('*')):
+        if p.is_file():
+            yield p, str(Path(src.name) / p.relative_to(src))
+
+
+def _top_roots(names):
+    """由归档内条目名计算顶层(第一层)名称集合"""
+    roots = set()
+    for raw in names:
+        n = raw.replace('\\', '/')
+        while n.startswith('./'):
+            n = n[2:]
+        n = n.lstrip('/')
+        if not n:
+            continue
+        roots.add(n.split('/', 1)[0])
+    return roots
+
+
+def _safe_name(name):
+    """仅保留文件名部分, 防止路径穿越"""
+    return Path(str(name).replace('\\', '/')).name
+
+
+def _prepare_target(output_dir: Path, roots, stem):
+    """决定解压目标目录, 并做冲突检查"""
+    if not roots:                        # 空压缩包
+        return output_dir
+    if len(roots) == 1:                  # 顶层唯一条目 => 直接解到输出路径
+        conflict = output_dir / next(iter(roots))
+        if conflict.exists():
+            raise ArcError('目标已存在, 拒绝覆盖: %s' % conflict)
+        LOG.debug('顶层唯一条目 "%s", 直接解到 %s', next(iter(roots)), output_dir)
+        return output_dir
+    target = output_dir / stem           # 多条目 => 以压缩包名建目录
+    if target.exists():
+        raise ArcError('目标目录已存在, 拒绝覆盖: %s' % target)
+    target.mkdir(parents=True)
+    LOG.debug('顶层有 %d 个条目, 解到 %s', len(roots), target)
+    return target
+
+
+# ---------------- 外部命令 (7z / rar) ----------------
+
+def find_tool(names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def run_tool(cmd):
+    """执行外部命令, stdout 逐行记入 debug 日志"""
+    LOG.debug('执行: %s', ' '.join(cmd))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors='replace')
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            LOG.debug('[工具] %s', line)
+    code = proc.wait()
+    if code != 0:
+        raise ArcError('外部命令失败(退出码 %d): %s' % (code, ' '.join(cmd)))
+
+
+# ---------------- 压缩 ----------------
+
+def compress_zip(src, out, level):
+    entries = list(iter_files(src))
+    dirs = [src] + sorted(d for d in src.rglob('*') if d.is_dir()) if src.is_dir() else []
+    total = sum(p.stat().st_size for p, _ in entries)
+    LOG.debug('待写入: %d 个文件 / %d 个目录, 原始大小 %s',
+              len(entries), len(dirs), human_size(total))
+    with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=level) as zf:
+        for d in dirs:                    # 保留空目录结构
+            arc = src.name if d == src else str(Path(src.name) / d.relative_to(src))
+            zf.writestr(arc + '/', b'')
+        for n, (p, arc) in enumerate(entries, 1):
+            LOG.debug('[%d/%d] 写入 %s (%s)', n, len(entries), arc,
+                      human_size(p.stat().st_size))
+            zf.write(p, arc)
+    return len(entries), total
+
+
+def compress_tar(src, out, fmt, level):
+    mode = {'tar': 'w', 'tar.gz': 'w:gz',
+            'tar.bz2': 'w:bz2', 'tar.xz': 'w:xz'}[fmt]
+    kw = {}
+    if fmt != 'tar':
+        lv = level
+        if fmt == 'tar.bz2' and lv == 0:   # bz2 不支持 0, 最低 1
+            lv = 1
+        kw['compresslevel'] = lv
+    counter = {'n': 0, 'bytes': 0}
+
+    def log_filter(ti):
+        counter['n'] += 1
+        if ti.isfile():
+            counter['bytes'] += ti.size
+            LOG.debug('[%d] 打包 %s (%s)', counter['n'], ti.name,
+                      human_size(ti.size))
+        else:
+            LOG.debug('[%d] 打包 %s (%s)', counter['n'], ti.name, tar_kind(ti))
+        return ti
+
+    with tarfile.open(out, mode, **kw) as tf:
+        tf.add(str(src), arcname=src.name, filter=log_filter)
+    return counter['n'], counter['bytes']
+
+
+def compress_stream(src, out, fmt, level):
+    """gz/bz2/xz: 压缩单个文件(流式, 带进度)"""
+    total = src.stat().st_size
+    openers = {'gz': (gzip.open, {'compresslevel': level}),
+               'bz2': (bz2.open, {'compresslevel': max(level, 1)}),
+               'xz': (lzma.open, {'preset': level})}
+    opener, kw = openers[fmt]
+    LOG.debug('待压缩: %s (%s)', src, human_size(total))
+    done, mark, next_mark = 0, max(total // 10, 1), max(total // 10, 1)
+    with open(src, 'rb') as fi, opener(out, 'wb', **kw) as fo:
+        while True:
+            chunk = fi.read(CHUNK)
+            if not chunk:
+                break
+            fo.write(chunk)
+            done += len(chunk)
+            if done >= next_mark:          # 每约 10% 打一条进度
+                LOG.debug('进度 %s / %s', human_size(done), human_size(total))
+                next_mark += mark
+    return 1, total
+
+
+def compress_7z(src, out, level):
+    tool = find_tool(('7z', '7za', '7zr'))
+    if not tool:
+        raise ArcError('未找到 7z 命令, 请安装 p7zip '
+                       '(如: apt install p7zip-full / brew install p7zip)')
+    run_tool([tool, 'a', '-t7z', '-mx=%d' % level, '-bd', '--',
+              str(out), str(src)])
+    entries = list(iter_files(src))
+    return len(entries), sum(p.stat().st_size for p, _ in entries)
+
+
+def do_compress(src: Path, output_arg, level):
+    level = DEFAULT_LEVEL if level is None else level
+    # 1. 确定输出路径与格式
+    if output_arg is None:
+        out = Path.cwd() / (src.name + '.zip')
+        fmt = 'zip'
+        LOG.debug('未指定 -o/--output, 默认生成: %s (zip)', out)
+    else:
+        out = Path(output_arg).expanduser()
+        fmt = format_from_suffix(out)
+        if fmt is None:
+            LOG.warning('输出路径 "%s" 后缀无法识别, 将使用 zip 并自动补全 .zip 后缀',
+                        out.name)
+            out = out.with_name(out.name + '.zip')
+            fmt = 'zip'
+    if fmt == 'rar':
+        raise ArcError('rar 为专有格式, 不支持创建 (但可以解压)')
+    if fmt in SINGLE_FILE_FORMATS and src.is_dir():
+        raise ArcError('%s 只能压缩单个文件; 目录请改用 .tar.gz / .tar.bz2 / .tar.xz' % fmt)
+    out = out.resolve()
+    if out.exists():
+        raise ArcError('输出已存在, 拒绝覆盖: %s' % out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    LOG.debug('开始压缩: %s -> %s (格式 %s, 压缩率 %s)', src, out, fmt, level)
+    if fmt != 'tar':
+        LOG.debug('压缩率说明: 0=仅存储, 1=最快, 9=最慢但压缩比最高')
+    t0 = time.time()
+
+    # 2. 分发到具体实现
+    if fmt == 'zip':
+        files, src_bytes = compress_zip(src, out, level)
+    elif fmt in TAR_FORMATS:
+        files, src_bytes = compress_tar(src, out, fmt, level)
+    elif fmt in SINGLE_FILE_FORMATS:
+        files, src_bytes = compress_stream(src, out, fmt, level)
+    else:  # 7z
+        files, src_bytes = compress_7z(src, out, level)
+
+    # 3. 汇总
+    out_bytes = out.stat().st_size
+    ratio = (out_bytes / src_bytes * 100) if src_bytes else 0.0
+    LOG.debug('完成: %s 个文件, 原始 %s -> 压缩后 %s (为原始的 %.1f%%), 耗时 %s',
+              files, human_size(src_bytes), human_size(out_bytes),
+              ratio, fmt_elapsed(time.time() - t0))
+    LOG.info('压缩完成: %s', out)
+    return 0
+
+
+# ---------------- 解压 ----------------
+
+def _check_zip_names(names, dest):
+    """解压前校验 zip 条目名, 防止目录穿越"""
+    for raw in names:
+        n = raw.replace('\\', '/').lstrip('/')
+        parts = [p for p in n.split('/') if p not in ('', '.')]
+        if any(p == '..' for p in parts):
+            raise ArcError('检测到不安全路径(目录穿越), 拒绝解压: %r' % raw)
+
+
+def extract_zip(archive, output_dir, stem):
+    with zipfile.ZipFile(archive) as zf:
+        infos = zf.infolist()
+        names = [i.filename for i in infos]
+        _check_zip_names(names, output_dir)
+        target = _prepare_target(output_dir, _top_roots(names), stem)
+        for n, info in enumerate(infos, 1):
+            LOG.debug('[%d/%d] 解出 %s (%s)', n, len(infos), info.filename,
+                      human_size(info.file_size))
+            zf.extract(info, target)
+
+
+def _check_tar_members(members, target):
+    """旧版 Python 无 filter='data' 时的手动安全校验"""
+    target = Path(target).resolve()
+    for m in members:
+        dest = (target / m.name).resolve()
+        if dest != target and target not in dest.parents:
+            raise ArcError('检测到不安全路径, 拒绝解压: %s' % m.name)
+        if m.issym() or m.islnk():
+            lt = (target / m.linkname).resolve()
+            if lt != target and target not in lt.parents:
+                raise ArcError('检测到不安全链接: %s -> %s' % (m.name, m.linkname))
+        if m.isdev():
+            raise ArcError('拒绝解压设备文件: %s' % m.name)
+
+
+def extract_tar(archive, output_dir, stem):
+    with tarfile.open(archive, 'r:*') as tf:   # r:* 自动识别压缩方式
+        members = tf.getmembers()
+        target = _prepare_target(output_dir, _top_roots(m.name for m in members), stem)
+        _check_tar_members(members, target)
+        for n, m in enumerate(members, 1):
+            LOG.debug('[%d/%d] 解出 %s (%s)', n, len(members), m.name,
+                      human_size(m.size) if m.isfile() else tar_kind(m))
+            try:                                # 3.12+ 用官方 data 过滤器
+                tf.extract(m, target, filter='data')
+            except TypeError:                   # 旧版本回退(已手动校验)
+                tf.extract(m, target)
+
+
+def extract_single(archive, output_dir, fmt):
+    """gz/bz2/xz: 解压为单个文件, 文件名取自 gzip 头或去掉后缀"""
+    name = _safe_name(gzip_original_name(archive) if fmt == 'gz'
+                      else archive_stem(archive))
+    out = output_dir / name
+    if out.exists():
+        raise ArcError('目标已存在, 拒绝覆盖: %s' % out)
+    opener = {'gz': gzip.open, 'bz2': bz2.open, 'xz': lzma.open}[fmt]
+    LOG.debug('解压为单文件: %s', out)
+    done, next_mark = 0, 64 * 1024 * 1024
+    with opener(archive, 'rb') as fi, open(out, 'wb') as fo:
+        while True:
+            chunk = fi.read(CHUNK)
+            if not chunk:
+                break
+            fo.write(chunk)
+            done += len(chunk)
+            if done >= next_mark:
+                LOG.debug('已解出 %s ...', human_size(done))
+                next_mark += 64 * 1024 * 1024
+    LOG.debug('单文件解压完成: %s (%s)', out, human_size(out.stat().st_size))
+
+
+def extract_external(archive, output_dir, stem, fmt):
+    """7z/rar: 先解到临时目录, 再按顶层规则归位"""
+    cands = ('7z', '7za', 'unrar') if fmt == 'rar' else ('7z', '7za', '7zr')
+    tool = find_tool(cands)
+    if not tool:
+        raise ArcError('未找到可处理 %s 的命令 (7z / unrar), 请先安装' % fmt)
+    tmp = output_dir / ('.arc_tmp_%d_%d' % (os.getpid(), int(time.time())))
+    tmp.mkdir()
+    try:
+        if os.path.basename(tool).lower().startswith('7z'):
+            cmd = [tool, 'x', '-y', '-bd', '-o' + str(tmp), '--', str(archive)]
+        else:
+            cmd = [tool, 'x', '-y', str(archive), str(tmp) + os.sep]
+        run_tool(cmd)
+        roots = sorted(p.name for p in tmp.iterdir())
+        if not roots:
+            LOG.debug('压缩包为空')
+            return
+        if len(roots) == 1:
+            dst = output_dir / roots[0]
+            if dst.exists():
+                raise ArcError('目标已存在, 拒绝覆盖: %s' % dst)
+            shutil.move(str(tmp / roots[0]), str(dst))
+            LOG.debug('顶层唯一条目 "%s" -> %s', roots[0], dst)
+        else:
+            dst = output_dir / stem
+            if dst.exists():
+                raise ArcError('目标目录已存在, 拒绝覆盖: %s' % dst)
+            dst.mkdir(parents=True)
+            for r in roots:
+                shutil.move(str(tmp / r), str(dst / r))
+            LOG.debug('顶层 %d 个条目 -> %s', len(roots), dst)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def do_decompress(archive: Path, output_arg, fmt):
+    output_dir = (Path(output_arg).expanduser() if output_arg else Path.cwd()).resolve()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ArcError('输出路径已存在且不是目录: %s' % output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = archive_stem(archive)
+    LOG.debug('开始解压: %s -> %s (格式 %s)', archive, output_dir, fmt)
+    t0 = time.time()
+    if fmt == 'zip':
+        extract_zip(archive, output_dir, stem)
+    elif fmt in TAR_FORMATS:
+        extract_tar(archive, output_dir, stem)
+    elif fmt in SINGLE_FILE_FORMATS:
+        extract_single(archive, output_dir, fmt)
+    else:
+        extract_external(archive, output_dir, stem, fmt)
+    LOG.debug('解压完成, 耗时 %s', fmt_elapsed(time.time() - t0))
+    LOG.info('解压完成: %s -> %s', archive, output_dir)
+    return 0
+
+
+# ---------------- 仅查看 ----------------
+
+def list_zip(archive):
+    with zipfile.ZipFile(archive) as zf:
+        infos = zf.infolist()
+        print('压缩包: %s (共 %d 项)' % (archive, len(infos)))
+        print('%-4s %12s %12s %8s  %s' % ('类型', '原始大小', '压缩后', '比率', '名称'))
+        tu = tc = 0
+        for i in infos:
+            tu += i.file_size
+            tc += i.compress_size
+            ratio = (i.compress_size / i.file_size * 100) if i.file_size else 0.0
+            print('%-4s %12s %12s %7.1f%%  %s' % (
+                '目录' if i.is_dir() else '文件',
+                human_size(i.file_size), human_size(i.compress_size),
+                ratio, i.filename))
+        tr = (tc / tu * 100) if tu else 0.0
+        print('合计: 原始 %s, 压缩后 %s (为原始的 %.1f%%)' %
+              (human_size(tu), human_size(tc), tr))
+
+
+def list_tar(archive):
+    with tarfile.open(archive, 'r:*') as tf:
+        members = tf.getmembers()
+        print('压缩包: %s (共 %d 项)' % (archive, len(members)))
+        print('%-4s %12s  %s' % ('类型', '大小', '名称'))
+        tu = 0
+        for m in members:
+            if m.isfile():
+                tu += m.size
+            print('%-4s %12s  %s' % (
+                '目录' if m.isdir() else ('链接' if (m.issym() or m.islnk()) else '文件'),
+                human_size(m.size) if m.isfile() else '-', m.name))
+        print('合计: 文件总大小 %s' % human_size(tu))
+
+
+def list_single(archive, fmt):
+    name = gzip_original_name(archive) if fmt == 'gz' else None
+    opener = {'gz': gzip.open, 'bz2': bz2.open, 'xz': lzma.open}[fmt]
+    size = 0
+    with opener(archive, 'rb') as f:
+        while True:
+            c = f.read(CHUNK)
+            if not c:
+                break
+            size += len(c)
+    print('压缩包: %s (流式单文件格式 %s)' % (archive, fmt))
+    print('解压后文件名: %s' % (name or archive_stem(archive) + '.*'))
+    print('解压后大小: %s' % human_size(size))
+
+
+def list_external(archive, fmt):
+    cands = ('7z', '7za', 'unrar') if fmt == 'rar' else ('7z', '7za', '7zr')
+    tool = find_tool(cands)
+    if not tool:
+        raise ArcError('未找到可处理 %s 的命令 (7z / unrar), 请先安装' % fmt)
+    cmd = [tool, 'l', '--', str(archive)] if os.path.basename(tool).lower().startswith('7z') \
+        else [tool, 'l', str(archive)]
+    res = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    if res.returncode != 0:
+        raise ArcError('列出内容失败: %s' % (res.stderr.strip() or res.stdout.strip()))
+    print(res.stdout)
+
+
+def do_list(archive: Path, fmt):
+    if fmt == 'zip':
+        list_zip(archive)
+    elif fmt in TAR_FORMATS:
+        list_tar(archive)
+    elif fmt in SINGLE_FILE_FORMATS:
+        list_single(archive, fmt)
+    else:
+        list_external(archive, fmt)
+    return 0
+
+
+# ---------------- CLI ----------------
+
+def build_parser():
+    epilog = """示例:
+  arc.py -h
+  arc.py data                          # 压缩目录 -> ./data.zip (快速档)
+  arc.py data -o bak.tar.gz            # 压缩目录 -> bak.tar.gz
+  arc.py a.txt -o a.xz -c 9            # 单文件压缩, 最高压缩率
+  arc.py -i data.zip                   # 解压到当前目录(智能规则)
+  arc.py data.zip -o out               # 解压到 out/
+  arc.py -l data.tar.gz                # 只看内容, 不解压
+"""
+    p = argparse.ArgumentParser(
+        prog='arc.py', description='自动压缩 / 解压脚本 (v%s)' % VERSION,
+        epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('-l', '--list', '-仅查看', action='store_true', dest='list_only',
+                   help='仅列出压缩包内容, 不做解压')
+    p.add_argument('-i', '--input', '-输入', dest='input_opt', metavar='路径',
+                   help='输入路径 (推荐直接写位置参数)')
+    p.add_argument('-o', '--output', '-输出', dest='output', metavar='路径',
+                   help='输出路径 (压缩=输出文件, 解压=输出目录); 默认: 压缩为 '
+                        '<name>.zip 于当前目录, 解压到当前目录')
+    p.add_argument('-c', '--compress-level', '-压缩率', dest='level',
+                   type=parse_level, metavar='级别',
+                   help='0~9 或别名(存储/最快/快速/标准/最大), 默认 %(default)s=快速')
+    p.add_argument('input_path', nargs='?', metavar='输入路径',
+                   help='输入文件或目录; 是压缩包则触发解压')
+    return p
+
+
+def main(argv=None):
+    setup_logging()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.input_path and not args.input_opt:
+        parser.print_usage(sys.stderr)
+        print('错误: 缺少输入路径 (可写位置参数, 或用 -i/--input 指定), '
+              '用 -h/--help 查看用法', file=sys.stderr)
+        return 2
+    if args.input_path and args.input_opt:
+        print('错误: 不要同时使用位置参数和 -i/--input 指定输入路径', file=sys.stderr)
+        return 2
+
+    input_path = Path(args.input_path or args.input_opt).expanduser()
+    if not input_path.exists():
+        print('错误: 输入路径不存在: %s' % input_path, file=sys.stderr)
+        return 2
+    input_path = input_path.resolve()
+
+    # ---- 自动判断压缩 / 解压 ----
+    fmt = format_from_suffix(input_path)
+    if fmt is None and input_path.is_file():
+        fmt = sniff_format(input_path)          # 后缀未知 -> 读文件头
+        if fmt:
+            LOG.debug('后缀未识别, 通过文件头检测到格式: %s', fmt)
+    if fmt is None and input_path.is_dir():
+        LOG.debug('输入是目录 => 执行压缩')
+
+    try:
+        if fmt is not None:                     # 是压缩包 => 解压 / 查看
+            if args.list_only:
+                return do_list(input_path, fmt)
+            if args.level is not None:
+                LOG.debug('提示: 解压时 --compress-level 参数被忽略')
+            return do_decompress(input_path, args.output, fmt)
+        else:                                   # 否则 => 压缩
+            if args.list_only:
+                print('错误: -l/--list 只对压缩包有效, 输入不是可识别的压缩包',
+                      file=sys.stderr)
+                return 2
+            return do_compress(input_path, args.output, args.level)
+    except ArcError as e:
+        LOG.error('%s', e)
+        return 1
+    except KeyboardInterrupt:
+        LOG.error('已被用户中断')
+        return 130
+    except Exception as e:
+        LOG.error('发生未预期的错误: %s', e, exc_info=True)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
