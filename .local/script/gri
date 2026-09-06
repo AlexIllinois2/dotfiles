@@ -302,9 +302,12 @@ def pick_asset(release, cfg, name=None):
 
 ARIA2 = shutil.which("aria2c")
 
-def download(url, dest):
+ARIA2 = shutil.which("aria2c")
+
+def download(url, dest, token=None):
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    token = token or GITHUB_TOKEN
     if ARIA2:
         cmd = ["aria2c",
                "-x", "8", "-s", "8", "-k", "1M",
@@ -313,14 +316,19 @@ def download(url, dest):
                "--retry-wait=2", "-m", "3", "--connect-timeout=10",
                "--auto-file-renaming=false", "--allow-overwrite=true",
                "-d", str(dest.parent), "-o", dest.name, url]
+        if token:
+            # token 走 header, 不进 URL (不落日志/history); 302 跳转后的 CDN 签名 URL 无需鉴权
+            cmd[1:1] = ["--header", "Authorization: Bearer " + token]
         r = subprocess.run(cmd)
         if r.returncode != 0:
             die("下载失败 (aria2c 退出码 %d)" % r.returncode)
         return dest
     # 回退: 无 aria2 时用 urllib 流式下载
     print("未找到 aria2c, 使用 urllib 下载")
+    req = urllib.request.Request(url)
+    if token: req.add_header("Authorization", "Bearer " + token)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=30) as resp, open(tmp, "wb") as f:
+    with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
         total = getattr(resp, "getheader", lambda h: None)("Content-Length")
         if total: print("大小: %.1f MB" % (int(total) / 1048576))
         while True:
@@ -705,6 +713,82 @@ def _table(rows):
     return ["  " + "".join(_pad(c, ws[i]) if i < len(ws) - 1 else str(c)
                            for i, c in enumerate(r)) for r in rows]
 
+def _config_file():
+    try: return APPS_FILE.parent / "config.json"
+    except NameError: return Path.home() / ".config" / "gri" / "config.json"
+
+def _mask(t):
+    return t[:4] + "..." + t[-4:] if t and len(t) >= 12 else "***"
+
+def token_load():
+    env = os.environ.get("GITHUB_TOKEN")
+    if env: return env, "GITHUB_TOKEN 环境变量"
+    cf = _config_file()
+    if cf.exists():
+        try:
+            c = json.loads(cf.read_text())
+            if c.get("token"): return c["token"], "config.json"
+        except Exception: pass
+    return None, None
+
+def token_save(t):
+    cf = _config_file()
+    c = {}
+    if cf.exists():
+        try: c = json.loads(cf.read_text())
+        except Exception: c = {}
+    c["token"] = t
+    cf.write_text(json.dumps(c, indent=2))
+    cf.chmod(0o600)
+
+def cmd_token(args):
+    if args.clear:
+        if os.environ.get("GITHUB_TOKEN"):
+            print("注意: GITHUB_TOKEN 环境变量仍在生效, 优先级高于 config.json")
+        cf = _config_file()
+        changed = False
+        if cf.exists():
+            try:
+                c = json.loads(cf.read_text())
+                if "token" in c:
+                    del c["token"]
+                    cf.write_text(json.dumps(c, indent=2))
+                    changed = True
+            except Exception: pass
+        print("已清除 config.json 中的 token" if changed else "config.json 中没有 token")
+        return
+    val = args.value
+    if val is None:
+        t, src_ = token_load()
+        if not t:
+            print("未设置 token (匿名访问, API 限流 60 次/小时)")
+            print("设置: gri token <token>  或  export GITHUB_TOKEN=<token>")
+        else:
+            print("token 已设置 (%s): %s" % (src_, _mask(t)))
+            print("下载与 API 请求均携带此 token")
+        return
+    val = val.strip()
+    if len(val) < 20:
+        print("警告: token 长度 %d 偏短 (GitHub PAT 通常 40+ 字符), 仍已保存" % len(val))
+    token_save(val)
+    print("token 已保存到 %s (权限 600)" % _config_file())
+    if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_TOKEN") != val:
+        print("注意: GITHUB_TOKEN 环境变量与刚设置的值不同, 环境变量优先级更高")
+
+def _token_cli():
+    # 在 argparse 之前拦截 gri token 子命令
+    if len(sys.argv) > 1 and sys.argv[1] == "token":
+        args = argparse.Namespace(value=None, clear=False)
+        rest = sys.argv[2:]
+        if rest and rest[0] == "--clear":
+            args.clear = True
+        elif rest:
+            args.value = rest[0]
+        cmd_token(args)
+        sys.exit(0)
+
+GITHUB_TOKEN = token_load()[0]   # env 优先, 其次 config.json
+
 def cmd_list(_a):
     apps = load_apps()
     items = []
@@ -809,5 +893,6 @@ def main():
         print("\n已中断。"); sys.exit(130)
 
 if __name__ == "__main__":
+    _token_cli()
     main()
 
