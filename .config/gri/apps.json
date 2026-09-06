@@ -106,9 +106,6 @@
   "localsend/localsend": {
     "repo": "localsend/localsend"
   },
-  "nvm-sh/nvm": {
-    "repo": "nvm-sh/nvm"
-  },
   "oven-sh/bun": {
     "repo": "oven-sh/bun"
   }
