@@ -111,8 +111,5 @@
   },
   "oven-sh/bun": {
     "repo": "oven-sh/bun"
-  },
-  "rossmacarthur/sheldon": {
-    "repo": "rossmacarthur/sheldon"
   }
 }
