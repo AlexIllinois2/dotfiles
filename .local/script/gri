@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gri — GitHub Release Installer (aria2 edition, 隐式命令版)
+
+    gri                       已安装应用 -> 全量检查更新; 没有已安装 -> 安装 apps.json 全部
+    gri <app|owner/repo>      已安装 -> 更新; 未安装 (含从未 add) -> 安装并自动写入 apps.json
+    gri list / ls             已安装在前, 未安装在后
+    gri remove / rm <app|repo>...
+    gri download / dl <repo>  只下载 latest 收敛出的资产到当前目录, 不安装不记录
+    gri add <owner/repo>      只写入 apps.json, 不安装
+    gri update [names] [-y] / gri install <names>   显式形式
+"""
+import argparse, json, os, platform, re, shutil, subprocess, sys, tarfile
+import urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+HOME = Path.home()
+GR_HOME     = HOME / ".config" / "gri"
+APPS_FILE   = GR_HOME / "apps.json"
+STATE_FILE  = GR_HOME / "installed.json"
+CACHE_DIR   = HOME / ".cache" / "gri" / "downloads"
+DATA_DIR    = HOME / ".local" / "share" / "gri"
+BIN_DIR     = HOME / ".local" / "bin"
+DESKTOP_DIR = HOME / ".local" / "share" / "applications"
+SYSTEMD_DIR = HOME / ".config" / "systemd" / "user"
+API = "https://api.github.com"
+
+MACHINE = platform.machine().lower()
+ARCH_TOKENS = {"x86_64": ["x86_64", "amd64", "x64", "linux64"],
+               "aarch64": ["aarch64", "arm64", "armv8"]}
+OTHER_ARCH = {"x86_64": ["aarch64", "arm64", "armv7", "armhf", "i386", "i686", "386", "arm"],
+              "aarch64": ["x86_64", "amd64", "x64", "i386", "i686", "386", "armv7", "armhf"]}
+TAR_EXTS = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tar")
+BAD_EXT = (".deb", ".exe", ".msi", ".dmg", ".pkg", ".zip", ".sha256", ".sha512",
+           ".sig", ".asc", ".txt", ".json", ".pem", ".yml", ".xml", ".zsync", ".so",
+           ".desktop", ".png", ".svg", ".sh", ".bat")
+
+SAMPLE_APPS = {
+    "ripgrep": {"repo": "BurntSushi/ripgrep", "filter": "x86_64-unknown-linux-musl", "type": "tar.gz", "bins": ["rg"]},
+    "fd":      {"repo": "sharkdp/fd", "filter": "x86_64-unknown-linux-gnu", "type": "tar.gz", "bins": ["fd"]},
+    "bat":     {"repo": "sharkdp/bat", "filter": "x86_64-unknown-linux-gnu", "type": "tar.gz", "bins": ["bat"]},
+    "lazygit": {"repo": "jesseduffield/lazygit", "filter": "Linux_x86_64", "type": "tar.gz", "bins": ["lazygit"]},
+}
+STATE = {}
+
+class GriError(Exception): pass
+def die(msg): raise GriError(msg)
+
+# ---------------------------------------------------------------- GitHub API
+def api_get(path):
+    req = urllib.request.Request(API + path, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "gri/2.1"})
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token: req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            die("GitHub API 限流 (匿名 60 次/小时)。稍后再试, 或 export GITHUB_TOKEN=...")
+        if e.code == 404: raise FileNotFoundError(path)
+        die("GitHub API HTTP %d: %s" % (e.code, e.reason))
+    except urllib.error.URLError as e:
+        die("网络错误: %s" % e.reason)
+
+def get_latest_release(repo):
+    try: return api_get("/repos/%s/releases/latest" % repo)
+    except FileNotFoundError: pass
+    try: rels = api_get("/repos/%s/releases?per_page=1" % repo)
+    except FileNotFoundError:
+        die("仓库不存在或无权访问: %s (私有仓库需设置 GITHUB_TOKEN)" % repo)
+    if not rels: die("%s 没有任何 release" % repo)
+    return rels[0]
+
+# ---------------------------------------------------------------- 资产收敛
+def asset_type(name):
+    n = name.lower()
+    if n.endswith(".rpm"): return "rpm"
+    if n.endswith(".appimage") or "appimage" in n: return "appimage"
+    if any(n.endswith(e) for e in TAR_EXTS): return "tar.gz"
+    return None
+
+def auto_pick_asset(release):
+    """启发式: 排除非 Linux/垃圾扩展名, 架构匹配加分, 静态链接微加分。"""
+    best, best_score = None, -999
+    mine = ARCH_TOKENS.get(MACHINE, [])
+    theirs = OTHER_ARCH.get(MACHINE, [])
+    for a in release.get("assets", []):
+        n = a["name"].lower()
+        if asset_type(n) is None or n.endswith(BAD_EXT): continue
+        score = 0
+        if any(m in n for m in mine): score += 10
+        if any(o in n for o in theirs): score -= 10
+        if "musl" in n or "unknown-linux" in n: score += 2
+        if score > best_score: best, best_score = a, score
+    return best
+
+def pick_asset(release, cfg):
+    assets = release.get("assets", [])
+    pattern = cfg.get("filter")
+    if pattern:
+        cands = [a for a in assets if re.search(pattern, a["name"])]
+        arch = cfg.get("arch")
+        if arch:
+            pref = [a for a in cands if arch in a["name"]]
+            cands = pref or cands
+        if cands: return cands[0]
+        die("没有匹配 filter=%r 的资产。可用:\n  %s"
+            % (pattern, "\n  ".join(a["name"] for a in assets) or "(无)"))
+    a = auto_pick_asset(release)
+    if a: return a
+    die("latest 中没有可识别的 Linux 资产。可用:\n  %s"
+        % ("\n  ".join(a["name"] for a in assets) or "(无)"))
+
+# ---------------------------------------------------------------- 下载 (aria2)
+def download(url, dest):
+    if not shutil.which("aria2c"):
+        die("未找到 aria2c, 请先安装: sudo dnf install aria2")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["aria2c", "--dir", str(dest.parent), "-o", dest.name,
+           "-c", "-x", "8", "-s", "8",
+           "--max-tries=5", "--retry-wait=3",
+           "--console-log-level=warn", "--summary-interval=0",
+           "--auto-file-renaming=false", "--allow-overwrite=true", url]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0 or not dest.exists():
+        die("下载失败 (aria2c 退出码 %d): %s" % (rc, url))
+
+# ---------------------------------------------------------------- 工具函数
+def tag_version(tag): return tag.lstrip("vV")
+def ver_key(v): return [int(x) for x in re.findall(r"\d+", v)] or [0]
+
+def find_file(root, name):
+    cands = [p for p in root.rglob(name) if p.is_file()]
+    if not cands: return None
+    exes = [p for p in cands if os.access(p, os.X_OK)]
+    return (exes or cands)[0]
+
+def detect_bins(app_dir):
+    """自动发现二进制: 优先 bin/ 目录下, 其次浅层可执行文件。"""
+    found = {}
+    for p in app_dir.rglob("*"):
+        if not p.is_file(): continue
+        if p.name.lower().endswith(BAD_EXT): continue
+        rel = p.relative_to(app_dir)
+        if p.parent.name == "bin" or (os.access(p, os.X_OK) and len(rel.parts) <= 2):
+            found.setdefault(p.name, p)
+    return sorted(found)[:5]
+
+def safe_extract(tar, dest):
+    try: tar.extractall(dest, filter="data")
+    except TypeError:
+        dest = dest.resolve()
+        for m in tar.getmembers():
+            p = (dest / m.name).resolve()
+            if not str(p).startswith(str(dest) + os.sep):
+                die("压缩包内存在不安全路径: %s" % m.name)
+        tar.extractall(dest)
+
+def load_apps():
+    if not APPS_FILE.exists():
+        GR_HOME.mkdir(parents=True, exist_ok=True)
+        APPS_FILE.write_text(json.dumps(SAMPLE_APPS, indent=2) + "\n")
+        print("已生成示例配置 %s, 可按需编辑。" % APPS_FILE)
+    try: return json.loads(APPS_FILE.read_text())
+    except json.JSONDecodeError as e: die("apps.json 解析失败: %s" % e)
+
+def save_apps(apps):
+    APPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    APPS_FILE.write_text(json.dumps(apps, indent=2, sort_keys=True) + "\n")
+
+def resolve(token, apps):
+    """token -> (name, cfg, auto)。auto=True 表示这是从未 add 过的 owner/repo。"""
+    if token in apps: return token, apps[token], False
+    if "/" in token:
+        repo = token.strip("/")
+        name = repo.split("/")[-1]
+        if name in apps and apps[name].get("repo") == repo:
+            return name, apps[name], False
+        return name, {"repo": repo, "arch": MACHINE}, True
+    if token in STATE:
+        rec = STATE[token]
+        cfg = {k: rec[k] for k in ("repo", "type", "bins", "arch") if rec.get(k)}
+        if cfg.get("repo"): return token, cfg, False
+    die("无法识别 %r: 不是 apps.json 中的应用, 也不是已安装应用或 owner/repo 形式" % token)
+
+def load_state():
+    if STATE_FILE.exists():
+        try: STATE.clear(); STATE.update(json.loads(STATE_FILE.read_text()))
+        except json.JSONDecodeError as e: die("installed.json 损坏: %s" % e)
+    return STATE
+
+def save_state():
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(STATE, indent=2, sort_keys=True) + "\n")
+
+# ---------------------------------------------------------------- 安装实现
+def fix_exec(text, bins, bin_dir):
+    def repl(m):
+        parts = m.group(1).strip().strip('"').split()
+        if parts and os.path.basename(parts[0]) in bins and not Path(parts[0]).is_absolute():
+            parts[0] = str(bin_dir / os.path.basename(parts[0]))
+            return "Exec=" + " ".join(parts)
+        return m.group(0)
+    return re.sub(r"^Exec=(.*)$", repl, text, flags=re.M)
+
+def install_desktop(name, cfg, app_dir, bin_dir):
+    if cfg.get("desktop") is False: return None
+    bins = cfg.get("bins", [])
+    for f in app_dir.rglob("*.desktop"):
+        return _write_desktop(name, fix_exec(f.read_text(errors="replace"), bins, bin_dir))
+    dc = cfg.get("desktop")
+    if isinstance(dc, dict):
+        exe = dc.get("exec") or str(bin_dir / (bins[0] if bins else name))
+        text = ("[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nIcon=%s\n"
+                "Terminal=false\nCategories=%s\n"
+                % (dc.get("name", name), exe, dc.get("icon", name), dc.get("categories", "Utility")))
+        return _write_desktop(name, text)
+    return None
+
+def _write_desktop(name, text):
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = DESKTOP_DIR / ("gri-%s.desktop" % name)
+    dest.write_text(text)
+    return str(dest)
+
+def install_service(name, cfg):
+    svc = cfg.get("service")
+    if not svc: return None
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    bins = cfg.get("bins", [])
+    exe = svc.get("exec") or str(BIN_DIR / (bins[0] if bins else name))
+    text = ("[Unit]\nDescription=%s\n\n[Service]\nExecStart=%s\nRestart=%s\n\n"
+            "[Install]\nWantedBy=default.target\n"
+            % (svc.get("description", name), exe, svc.get("restart", "on-failure")))
+    dest = SYSTEMD_DIR / (name + ".service")
+    dest.write_text(text)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    if svc.get("enable", True):
+        subprocess.run(["systemctl", "--user", "enable", "--now", dest.name], check=False)
+    return str(dest)
+
+def install_tar(name, cfg, tag, asset, archive):
+    app_dir = DATA_DIR / name / tag_version(tag)
+    if app_dir.exists(): shutil.rmtree(app_dir)
+    app_dir.mkdir(parents=True)
+    with tarfile.open(archive, "r:*") as t: safe_extract(t, app_dir)
+
+    bins = cfg.get("bins") or detect_bins(app_dir)
+    if not bins:
+        die("[%s] 无法自动确定二进制, 请在 apps.json 的 %r 条目中指定 bins" % (name, name))
+    bin_dir = Path(cfg.get("bin_dir", str(BIN_DIR))).expanduser()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    links = []
+    for b in bins:
+        src = find_file(app_dir, b)
+        if src is None: die("[%s] 解压后未找到二进制 %r" % (name, b))
+        if not os.access(src, os.X_OK): src.chmod(src.stat().st_mode | 0o111)
+        link = bin_dir / b
+        if link.is_symlink() or link.exists(): link.unlink()
+        link.symlink_to(src)
+        links.append(str(link))
+
+    eff = dict(cfg); eff["bins"] = bins          # 检测到的 bins 传给 desktop/service
+    desktop = install_desktop(name, eff, app_dir, bin_dir)
+    service = install_service(name, eff)
+    if (DATA_DIR / name).exists():
+        for v in (DATA_DIR / name).iterdir():
+            if v.name != tag_version(tag): shutil.rmtree(v, ignore_errors=True)
+
+    STATE[name] = {"version": tag_version(tag), "tag": tag, "asset": asset["name"],
+                   "type": "tar.gz", "dir": str(app_dir), "bins": bins, "links": links,
+                   "desktops": [desktop] if desktop else [],
+                   "services": [service] if service else []}
+
+def install_rpm(name, cfg, tag, asset, archive):
+    pkg = asset["name"]
+    r = subprocess.run(["rpm", "-qp", "--qf", "%{NAME}", "--nosignature", str(archive)],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip(): pkg = r.stdout.strip()
+    if subprocess.run(["sudo", "dnf", "install", "-y", str(archive)]).returncode != 0:
+        die("[%s] dnf 安装失败" % name)
+    STATE[name] = {"version": tag_version(tag), "tag": tag,
+                   "asset": asset["name"], "type": "rpm", "pkg": pkg}
+
+def install_appimage(name, cfg, tag, asset, archive):
+    bin_dir = Path(cfg.get("bin_dir", str(BIN_DIR))).expanduser()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    bins = cfg.get("bins") or [name]
+    dest = bin_dir / bins[0]
+    shutil.copy2(archive, dest)
+    dest.chmod(0o755)
+    desktop = install_desktop(name, dict(cfg, bins=bins), dest.parent, bin_dir)
+    STATE[name] = {"version": tag_version(tag), "tag": tag, "asset": asset["name"],
+                   "type": "appimage", "bins": bins, "dir": str(dest),
+                   "links": [str(dest)], "desktops": [desktop] if desktop else []}
+
+def save_auto_app(name, cfg):
+    rec = STATE.get(name, {})
+    entry = {"repo": cfg["repo"]}
+    if rec.get("type") and rec["type"] != "tar.gz": entry["type"] = rec["type"]
+    if cfg.get("arch"): entry["arch"] = cfg["arch"]
+    if rec.get("bins"): entry["bins"] = rec["bins"]
+    apps = json.loads(APPS_FILE.read_text()) if APPS_FILE.exists() else {}
+    apps[name] = entry
+    save_apps(apps)
+    print("[%s] 已写入 apps.json, 之后 gri / gri %s 会自动跟踪更新" % (name, name))
+
+def install_app(name, cfg, release=None, auto_add=False):
+    release = release or get_latest_release(cfg["repo"])
+    tag = release["tag_name"]
+    asset = pick_asset(release, cfg)
+    print("[%s] %s -> %s (%.1f MB)" % (name, tag, asset["name"], asset.get("size", 0) / 1e6))
+    dest = CACHE_DIR / ("%s-%s" % (name, asset["name"]))
+    download(asset["browser_download_url"], dest)
+
+    t = cfg.get("type") or asset_type(asset["name"]) or "tar.gz"
+    if t == "rpm": install_rpm(name, cfg, tag, asset, dest)
+    elif t == "appimage": install_appimage(name, cfg, tag, asset, dest)
+    else: install_tar(name, cfg, tag, asset, dest)
+
+    STATE[name].update({"repo": cfg["repo"], "arch": cfg.get("arch")})
+    save_state()
+    if auto_add: save_auto_app(name, cfg)
+    print("[%s] 安装完成: %s" % (name, tag_version(tag)))
+
+# ---------------------------------------------------------------- 子命令
+def update_one(name, cfg):
+    rel = get_latest_release(cfg["repo"])
+    new, cur = rel["tag_name"], STATE.get(name, {}).get("tag")
+    if cur == new:
+        print("[%s] 已是最新 %s" % (name, new)); return
+    if cur and ver_key(new) < ver_key(cur):
+        print("[%s] 远端 %s 低于本地 %s, 跳过" % (name, new, cur)); return
+    install_app(name, cfg, release=rel)
+
+def confirm(prompt):
+    try: return input(prompt).strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt): return False
+
+def cmd_run(args):
+    apps = load_apps()
+    for token in args.tokens:
+        name, cfg, auto = resolve(token, apps)
+        if name in STATE: update_one(name, cfg)
+        else: install_app(name, cfg, auto_add=auto)
+        apps = json.loads(APPS_FILE.read_text()) if APPS_FILE.exists() else {}
+
+def cmd_default(_args):
+    apps = load_apps()
+    if STATE:
+        print("已安装 %d 个应用, 检查更新..." % len(STATE))
+        cmd_update(argparse.Namespace(names=[], yes=False))
+        return
+    if not apps: die("apps.json 为空, 用 gri add <owner/repo> 添加应用")
+    print("没有已安装应用, 将安装 apps.json 中的 %d 个:" % len(apps))
+    for n in sorted(apps): print("  %-16s %s" % (n, apps[n].get("repo", "?")))
+    if not confirm("继续? [y/N] "):
+        print("已取消。"); return
+    for n in sorted(apps): install_app(n, apps[n])
+
+def cmd_install(args):
+    apps = load_apps()
+    for token in args.names:
+        name, cfg, auto = resolve(token, apps)
+        install_app(name, cfg, auto_add=auto)
+        apps = json.loads(APPS_FILE.read_text()) if APPS_FILE.exists() else {}
+
+def cmd_update(args):
+    apps = load_apps()
+    if args.names:
+        targets = [resolve(t, apps)[:2] for t in args.names]
+    else:
+        targets = []
+        for n in STATE:
+            cfg = apps.get(n)
+            if cfg is None:
+                rec = STATE[n]
+                cfg = {k: rec[k] for k in ("repo", "type", "bins", "arch") if rec.get(k)}
+            if cfg.get("repo"): targets.append((n, cfg))
+        if not targets: die("没有已安装的应用 (gri <owner/repo> 直接安装)")
+        print("检查 %d 个已安装应用的更新..." % len(targets))
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(get_latest_release, cfg["repo"]): n for n, cfg in targets}
+        releases = {futs[f]: f.result() for f in futs}
+
+    updates = []
+    for name, rel in releases.items():
+        new, cur = rel["tag_name"], STATE.get(name, {}).get("tag")
+        if cur == new: continue
+        if cur and ver_key(new) < ver_key(cur):
+            print("  跳过 %s: 远端 %s 低于本地 %s" % (name, new, cur)); continue
+        updates.append((name, rel))
+    if not updates: print("全部已是最新。"); return
+    print("\n可更新 %d 个:" % len(updates))
+    for name, rel in updates:
+        print("  %-16s %s -> %s" % (name, STATE.get(name, {}).get("tag", "(未安装)"), rel["tag_name"]))
+    if not args.yes and not confirm("是否继续? [y/N] "):
+        print("已取消。"); return
+    for name, rel in updates:
+        cfg = dict(apps.get(name) or
+                   {k: STATE[name][k] for k in ("repo", "type", "bins", "arch") if STATE[name].get(k)})
+        install_app(name, cfg, release=rel)
+
+def cmd_remove(args):
+    for token in args.names:
+        name = token if token in STATE else token.strip("/").split("/")[-1]
+        rec = STATE.get(name)
+        if rec is None: die("未安装应用: %s (gri list 查看)" % token)
+        if rec["type"] == "rpm":
+            if subprocess.run(["sudo", "dnf", "remove", "-y", rec.get("pkg", name)]).returncode != 0:
+                print("[%s] dnf 卸载失败, 仅清除 gri 记录" % name)
+        else:
+            for l in rec.get("links", []):
+                p = Path(l)
+                if p.is_symlink() or p.is_file(): p.unlink()
+            for d in rec.get("desktops", []): Path(d).unlink(missing_ok=True)
+            if rec.get("services"):
+                for s in rec.get("services", []):
+                    subprocess.run(["systemctl", "--user", "disable", "--now", Path(s).name], check=False)
+                    Path(s).unlink(missing_ok=True)
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+            shutil.rmtree(DATA_DIR / name, ignore_errors=True)
+        STATE.pop(name, None)
+        save_state()
+        print("[%s] 已卸载" % name)
+
+def cmd_list(_a):
+    apps = load_apps()
+    installed = sorted(STATE)
+    available = [n for n in sorted(apps) if n not in STATE]
+    if not installed and not available:
+        print("没有应用。用 gri add <owner/repo> 或 gri <owner/repo> 安装。"); return
+    if installed:
+        print("已安装:")
+        for n in installed:
+            r = STATE[n]
+            print("  %-20s %-10s %-9s %s" % (n, r.get("version", "?"), r.get("type", "?"),
+                                             r.get("repo") or r.get("asset", "?")))
+    if available:
+        print("未安装:")
+        for n in available:
+            print("  %-20s %s" % (n, apps[n].get("repo", "?")))
+
+def cmd_download(args):
+    apps = load_apps()
+    for token in args.names:
+        name, cfg, _ = resolve(token, apps)
+        rel = get_latest_release(cfg["repo"])
+        asset = pick_asset(rel, cfg)
+        print("[%s] %s -> %s (%.1f MB)" % (name, rel["tag_name"], asset["name"],
+                                           asset.get("size", 0) / 1e6))
+        download(asset["browser_download_url"], Path.cwd() / asset["name"])
+        print("已下载到 %s" % (Path.cwd() / asset["name"]))
+
+def cmd_add(args):
+    apps = load_apps()
+    for token in args.names:
+        name, cfg, auto = resolve(token, apps)
+        if not auto:
+            print("[%s] 已存在于 apps.json, 跳过" % name); continue
+        rel = get_latest_release(cfg["repo"])
+        asset = pick_asset(rel, cfg)
+        cfg["type"] = asset_type(asset["name"]) or "tar.gz"
+        apps[name] = cfg
+        print("[%s] %s -> %s (type=%s), 写入 apps.json (未安装)"
+              % (name, rel["tag_name"], asset["name"], cfg["type"]))
+    save_apps(apps)
+
+def cmd_info(args):
+    apps = load_apps()
+    for name in args.names:
+        n, cfg, _ = resolve(name, apps)
+        print("== %s ==" % n)
+        print("配置:", json.dumps(cfg, indent=2, ensure_ascii=False))
+        print("状态:", json.dumps(STATE.get(n, "(未安装)"), indent=2, ensure_ascii=False))
+
+# ---------------------------------------------------------------- 入口
+ALIASES = {"rm": "remove", "ls": "list", "dl": "download", "up": "update"}
+KNOWN = {"install", "update", "remove", "list", "download", "add", "info"}
+
+def main():
+    argv = sys.argv[1:]
+    if argv: argv[0] = ALIASES.get(argv[0], argv[0])
+    if not argv: argv = ["__default__"]
+    elif argv[0] not in KNOWN: argv = ["__run__"] + argv   # 裸参数 -> 安装或更新
+
+    p = argparse.ArgumentParser(prog="gri", description="GitHub Release Installer (aria2 edition)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("__default__").set_defaults(func=cmd_default)
+    s = sub.add_parser("__run__"); s.add_argument("tokens", nargs="+"); s.set_defaults(func=cmd_run)
+    s = sub.add_parser("install"); s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_install)
+    s = sub.add_parser("update"); s.add_argument("names", nargs="*")
+    s.add_argument("-y", "--yes", action="store_true"); s.set_defaults(func=cmd_update)
+    s = sub.add_parser("remove"); s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_remove)
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    s = sub.add_parser("download"); s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_download)
+    s = sub.add_parser("add"); s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_add)
+    s = sub.add_parser("info"); s.add_argument("names", nargs="+"); s.set_defaults(func=cmd_info)
+
+    load_state()
+    args = p.parse_args(argv)
+    try: args.func(args)
+    except GriError as e:
+        print("gri: 错误: %s" % e, file=sys.stderr); sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n已中断。"); sys.exit(130)
+
+if __name__ == "__main__":
+    main()
+
