@@ -97,18 +97,50 @@ def auto_pick_asset(release):
         if score > best_score: best, best_score = a, score
     return best
 
+OS_TOKENS = {"linux": ["linux"],
+             "darwin": ["darwin", "macos", "osx", "apple"],
+             "windows": ["windows", "win32", "win64", "msvc", "mingw"]}
+
+def _norm(s): return s.lower().replace("-", "_")
+
+def cond_match(name, cond):
+    """匹配原版 Rust gri 的结构化 filter 条件 (field/op/value)。"""
+    if not isinstance(cond, dict): return True
+    field, op, value = cond.get("field"), cond.get("op", "in"), cond.get("value")
+    n = _norm(name)
+    vals = [str(v) for v in value] if isinstance(value, list) \
+        else ([str(value)] if value is not None else [])
+    if field in ("os", "arch", "libc"):
+        toks = []
+        for v in vals:
+            if field == "os": toks += OS_TOKENS.get(_norm(v), [_norm(v)])
+            else: toks.append(_norm(v))
+        return any(t in n for t in toks)
+    if op in ("eq", "equals"):  return not vals or n == _norm(vals[0])
+    if op == "regex":           return bool(vals) and re.search(vals[0], name) is not None
+    # in / contains / 未知 op: 子串匹配
+    return any(_norm(v) in n for v in vals)
+
+def filter_matches(name, flt):
+    """filter 兼容三种写法: 正则字符串 / 单条件对象 / 条件列表 (原版 Rust gri 格式)。"""
+    if flt is None: return True
+    if isinstance(flt, str): return re.search(flt, name) is not None
+    if isinstance(flt, dict): flt = [flt]
+    if isinstance(flt, list): return all(cond_match(name, c) for c in flt)
+    return True
+
 def pick_asset(release, cfg):
     assets = release.get("assets", [])
     pattern = cfg.get("filter")
-    if pattern:
-        cands = [a for a in assets if re.search(pattern, a["name"])]
+    if pattern is not None and not isinstance(pattern, bool):
+        cands = [a for a in assets if filter_matches(a["name"], pattern)]
         arch = cfg.get("arch")
         if arch:
             pref = [a for a in cands if arch in a["name"]]
             cands = pref or cands
         if cands: return cands[0]
-        die("没有匹配 filter=%r 的资产。可用:\n  %s"
-            % (pattern, "\n  ".join(a["name"] for a in assets) or "(无)"))
+        die("没有匹配 filter 的资产。可用:\n  %s"
+            % ("\n  ".join(a["name"] for a in assets) or "(无)"))
     a = auto_pick_asset(release)
     if a: return a
     die("latest 中没有可识别的 Linux 资产。可用:\n  %s"
