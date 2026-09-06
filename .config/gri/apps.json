@@ -1,28 +1,60 @@
 {
-  "docmirror/dev-sidecar": {
-    "repo": "docmirror/dev-sidecar"
+  "AnInsomniacy/motrix-next": {
+    "repo": "AnInsomniacy/motrix-next"
   },
-  "jswysnemc/mark-shot": {
-    "repo": "jswysnemc/mark-shot"
+  "astral-sh/uv": {
+    "filter": [
+      {
+        "field": "os",
+        "op": "in",
+        "value": [
+          "linux"
+        ]
+      },
+      {
+        "field": "arch",
+        "op": "in",
+        "value": [
+          "x86_64",
+          "x86-64",
+          "amd64",
+          "x64"
+        ]
+      },
+      {
+        "field": "libc",
+        "op": "in",
+        "value": [
+          "gnu"
+        ]
+      },
+      {
+        "field": "contains",
+        "op": "contains",
+        "value": "uv-x86_64-unknown-linux-gnu.tar.gz"
+      }
+    ],
+    "layout": {
+      "bins": [
+        {
+          "path": "uv"
+        },
+        {
+          "path": "uvx"
+        }
+      ],
+      "stripComponents": 1
+    },
+    "repo": "astral-sh/uv",
+    "type": "archive"
   },
   "clash-verge-rev/clash-verge-rev": {
     "repo": "clash-verge-rev/clash-verge-rev"
   },
-  "AnInsomniacy/motrix-next": {
-    "repo": "AnInsomniacy/motrix-next"
-  },
-  "rossmacarthur/sheldon": {
-    "repo": "rossmacarthur/sheldon"
-  },
-  "localsend/localsend": {
-    "repo": "localsend/localsend"
-  },
-  "ggml-org/llama.cpp": {
-    "repo": "ggml-org/llama.cpp"
+  "docmirror/dev-sidecar": {
+    "repo": "docmirror/dev-sidecar"
   },
   "earendil-works/pi": {
-    "repo": "earendil-works/pi",
-    "type": "archive",
     "filter": [
       {
         "field": "os",
@@ -55,61 +87,32 @@
       }
     ],
     "layout": {
-      "stripComponents": 1,
       "bins": [
         {
           "path": "pi"
         }
-      ]
-    }
+      ],
+      "stripComponents": 1
+    },
+    "repo": "earendil-works/pi",
+    "type": "archive"
+  },
+  "ggml-org/llama.cpp": {
+    "repo": "ggml-org/llama.cpp"
+  },
+  "jswysnemc/mark-shot": {
+    "repo": "jswysnemc/mark-shot"
+  },
+  "localsend/localsend": {
+    "repo": "localsend/localsend"
+  },
+  "nvm-sh/nvm": {
+    "repo": "nvm-sh/nvm"
   },
   "oven-sh/bun": {
     "repo": "oven-sh/bun"
   },
-  "astral-sh/uv": {
-    "repo": "astral-sh/uv",
-    "type": "archive",
-    "filter": [
-      {
-        "field": "os",
-        "value": [
-          "linux"
-        ],
-        "op": "in"
-      },
-      {
-        "field": "arch",
-        "value": [
-          "x86_64",
-          "x86-64",
-          "amd64",
-          "x64"
-        ],
-        "op": "in"
-      },
-      {
-        "field": "libc",
-        "value": [
-          "gnu"
-        ],
-        "op": "in"
-      },
-      {
-        "field": "contains",
-        "value": "uv-x86_64-unknown-linux-gnu.tar.gz",
-        "op": "contains"
-      }
-    ],
-    "layout": {
-      "stripComponents": 1,
-      "bins": [
-        {
-          "path": "uv"
-        },
-        {
-          "path": "uvx"
-        }
-      ]
-    }
+  "rossmacarthur/sheldon": {
+    "repo": "rossmacarthur/sheldon"
   }
 }
