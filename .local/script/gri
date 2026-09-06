@@ -11,9 +11,10 @@ gri — GitHub Release Installer (aria2 edition, 隐式命令版)
     gri add <owner/repo>      只写入 apps.json, 不安装
     gri update [names] [-y] / gri install <names>   显式形式
 """
-import argparse, json, os, platform, re, shutil, subprocess, sys, tarfile
+import argparse, json, os, platform, re, shutil, subprocess, sys, tarfile, unicodedata
 import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 HOME = Path.home()
@@ -79,6 +80,7 @@ def asset_type(name):
     n = name.lower()
     if n.endswith(".rpm"): return "rpm"
     if n.endswith(".appimage") or "appimage" in n: return "appimage"
+    if n.endswith(".zip"): return "zip"
     if any(n.endswith(e) for e in TAR_EXTS): return "tar.gz"
     return None
 
@@ -129,38 +131,205 @@ def filter_matches(name, flt):
     if isinstance(flt, list): return all(cond_match(name, c) for c in flt)
     return True
 
-def pick_asset(release, cfg):
+FACETS = [
+    ("系统", ("linux", "darwin", "macos", "osx", "windows", "freebsd", "ubuntu"), "os"),
+    ("架构", ("x86_64", "x64", "amd64", "aarch64", "arm64", "armv7", "i386"), "arch"),
+    ("libc", ("gnu", "musl", "android"), "libc"),
+]
+
+def _looks_ver(v):
+    # 疑似版本号/构建号: 1.2.3 / v1.2 / b6234 / 纯数字
+    return bool(re.search(r"v?\d+[._]\d+|(?<!\w)b\d{3,}(?!\w)|^v?\d+$", str(v)))
+
+def _infer_conds(asset_name):
+    # 从资产名反推语义条件: 只取 ext/os/arch/libc 稳定 token, 版本号天然排除
+    n = asset_name.lower()
+    conds = []
+    t = asset_type(n)
+    if t: conds.append({"field": "contains", "value": t})
+    for label, toks, field in FACETS:
+        for tok in toks:
+            if tok in n:
+                conds.append({"field": field, "op": "in", "value": [tok]})
+                break
+    return conds
+
+def _confirm(prompt):
+    try: return input(prompt).strip().lower() in ("y", "yes", "")
+    except (EOFError, KeyboardInterrupt): return False
+
+def interactive_converge(name, release, cfg):
+    assets = release.get("assets", [])
+    if not assets: die("%s latest 没有任何资产" % cfg.get("repo", name))
+    cands, conds = list(assets), []
+    print("为 %s (%s) 收敛资产, %d 个候选:" % (name, release.get("tag_name", "?"), len(cands)))
+    while len(cands) > 1:
+        if len(cands) <= 5:
+            print("\n剩余 %d 个候选:" % len(cands))
+            for i, a in enumerate(cands, 1):
+                print("  %d) %s" % (i, a["name"]))
+            menu = [("包含子串 (手动输入)", ("substr", None))]
+            listable = True
+        else:
+            exts = {}
+            for a in cands:
+                e = a["name"].rsplit(".", 1)[-1].lower()
+                exts[e] = exts.get(e, 0) + 1
+            menu = []
+            if len(exts) > 1:
+                menu.append(("后缀:  " + "  ".join("%s(%d)" % kv for kv in
+                              sorted(exts.items(), key=lambda x: -x[1])), ("ext", None)))
+            for label, toks, field in FACETS:
+                counts = [(t, sum(1 for a in cands if t in a["name"].lower())) for t in toks
+                          if any(t in a["name"].lower() for a in cands)]
+                if counts and (len(counts) > 1 or counts[0][1] < len(cands)):
+                    menu.append((label + ": " + " ".join("%s(%d)" % x for x in counts),
+                                 ("facet", (label, toks, field))))
+            menu.append(("包含子串 (手动输入)", ("substr", None)))
+            menu.append(("列出剩余候选直接选", ("list", None)))
+            print("\n剩余 %d 个候选, 选择收敛方式:" % len(cands))
+            listable = False
+        base = len(cands) + 1 if listable else 1
+        for i, (txt, _) in enumerate(menu, base):
+            print("  %d) %s" % (i, txt))
+        total = len(cands) + len(menu) if listable else len(menu)
+        try: c = input("选择 [1-%d] (回车取消): " % total).strip()
+        except (EOFError, KeyboardInterrupt): die("已取消")
+        if not c: die("已取消")
+        if not c.isdigit(): print("无效输入, 请输入数字"); continue
+        v = int(c)
+        if listable and 1 <= v <= len(cands):
+            cands = [cands[v - 1]]; continue
+        mi = v - len(cands) if listable else v
+        if not (1 <= mi <= len(menu)): print("无效序号"); continue
+        txt, data = menu[mi - 1]
+        kind = data[0]
+        if kind == "list":
+            for i, a in enumerate(cands, 1):
+                print("  %d) %s" % (i, a["name"]))
+            v2 = input("选择 [1-%d] (回车取消): " % len(cands)).strip()
+            if not v2: die("已取消")
+            if v2.isdigit() and 1 <= int(v2) <= len(cands):
+                cands = [cands[int(v2) - 1]]
+            else: print("无效输入"); continue
+        elif kind == "ext":
+            ekeys = sorted(exts.items(), key=lambda x: -x[1])
+            print("  后缀选项:")
+            for i, (e, cnt) in enumerate(ekeys, 1):
+                print("  %d) .%s (%d 个)" % (i, e, cnt))
+            v2 = input("选后缀 [1-%d]: " % len(ekeys)).strip()
+            if not v2.isdigit() or not (1 <= int(v2) <= len(ekeys)): print("无效输入"); continue
+            ext = ekeys[int(v2) - 1][0]
+            cands = [a for a in cands if a["name"].lower().endswith("." + ext)]
+            conds.append({"field": "contains", "value": ext})
+            print("-> 后缀 .%s, 剩 %d" % (ext, len(cands)))
+        elif kind == "facet":
+            label, toks, field = data[1]
+            counts = [(t, sum(1 for a in cands if t in a["name"].lower())) for t in toks
+                      if any(t in a["name"].lower() for a in cands)]
+            print("  %s 选项:" % label)
+            for i, (t, cnt) in enumerate(counts, 1):
+                print("  %d) %s (%d 个)" % (i, t, cnt))
+            v2 = input("选%s [1-%d]: " % (label, len(counts))).strip()
+            if not v2.isdigit() or not (1 <= int(v2) <= len(counts)): print("无效输入"); continue
+            val = counts[int(v2) - 1][0]
+            cands = [a for a in cands if val in a["name"].lower()]
+            conds.append({"field": field, "op": "in", "value": [val]})
+            print("-> %s=%s, 剩 %d" % (label, val, len(cands)))
+        elif kind == "substr":
+            v2 = input("包含子串: ").strip().lower()
+            if not v2: print("空值"); continue
+            cands = [a for a in cands if v2 in a["name"].lower()]
+            conds.append({"field": "contains", "value": v2})
+            print("-> 包含 %r, 剩 %d" % (v2, len(cands)))
+    asset = cands[0]
+    print("\n选定: %s" % asset["name"])
+    if not _confirm("使用此资产? [Y/n] "): die("已取消")
+
+    # 版本号剥离: contains 条件疑似版本号 -> 警告并移除
+    clean, stripped = [], []
+    for c in conds:
+        if (c.get("field") == "contains" and isinstance(c.get("value"), str)
+                and _looks_ver(c["value"])):
+            stripped.append(c["value"])
+        else: clean.append(c)
+    if stripped:
+        print("警告: 条件 %s 疑似版本号, 更新时会失效, 已剥离" % stripped)
+        conds = clean
+
+    # 直接选且无收敛条件 -> 从资产名推导语义 filter (版本安全)
+    if not conds:
+        inferred = _infer_conds(asset["name"])
+        if inferred:
+            print("从资产名推导的语义条件: %s" % json.dumps(inferred, ensure_ascii=False))
+            if _confirm("保存推导条件 (版本安全, 下次自动匹配)? [Y/n] "):
+                conds = inferred
+    if conds and _confirm("将以上条件保存到 apps.json 的 filter (下次自动匹配)? [Y/n] "):
+        cfg["filter"] = conds
+        try: apps = json.loads(APPS_FILE.read_text()) if APPS_FILE.exists() else {}
+        except Exception: apps = {}
+        entry = apps.get(name) or {"repo": cfg["repo"]}
+        entry.setdefault("repo", cfg["repo"])
+        entry["filter"] = conds
+        apps[name] = entry
+        save_apps(apps)
+        print("[%s] filter 已写入 apps.json" % name)
+    return asset
+
+def pick_asset(release, cfg, name=None):
     assets = release.get("assets", [])
     pattern = cfg.get("filter")
     if pattern is not None and not isinstance(pattern, bool):
         cands = [a for a in assets if filter_matches(a["name"], pattern)]
+        cands.sort(key=lambda a: 0 if asset_type(a["name"]) in ("rpm", "appimage", "tar.gz") else 1)
         arch = cfg.get("arch")
         if arch:
             pref = [a for a in cands if arch in a["name"]]
             cands = pref or cands
         if cands: return cands[0]
+        if name:
+            print("配置的 filter 未命中任何资产, 进入手动收敛:")
+            return interactive_converge(name, release, cfg)
         die("没有匹配 filter 的资产。可用:\n  %s"
             % ("\n  ".join(a["name"] for a in assets) or "(无)"))
     a = auto_pick_asset(release)
     if a: return a
+    if name:
+        print("无法自动识别资产, 进入手动收敛:")
+        return interactive_converge(name, release, cfg)
     die("latest 中没有可识别的 Linux 资产。可用:\n  %s"
         % ("\n  ".join(a["name"] for a in assets) or "(无)"))
 
-# ---------------------------------------------------------------- 下载 (aria2)
-def download(url, dest):
-    if not shutil.which("aria2c"):
-        die("未找到 aria2c, 请先安装: sudo dnf install aria2")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["aria2c", "--dir", str(dest.parent), "-o", dest.name,
-           "-c", "-x", "8", "-s", "8",
-           "--max-tries=5", "--retry-wait=3",
-           "--console-log-level=warn", "--summary-interval=0",
-           "--auto-file-renaming=false", "--allow-overwrite=true", url]
-    rc = subprocess.run(cmd).returncode
-    if rc != 0 or not dest.exists():
-        die("下载失败 (aria2c 退出码 %d): %s" % (rc, url))
+ARIA2 = shutil.which("aria2c")
 
-# ---------------------------------------------------------------- 工具函数
+def download(url, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if ARIA2:
+        cmd = ["aria2c",
+               "-x", "8", "-s", "8", "-k", "1M",
+               "-c", "--file-allocation=none",
+               "--console-log-level=warn", "--summary-interval=5",
+               "--retry-wait=2", "-m", "3", "--connect-timeout=10",
+               "--auto-file-renaming=false", "--allow-overwrite=true",
+               "-d", str(dest.parent), "-o", dest.name, url]
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            die("下载失败 (aria2c 退出码 %d)" % r.returncode)
+        return dest
+    # 回退: 无 aria2 时用 urllib 流式下载
+    print("未找到 aria2c, 使用 urllib 下载")
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with urllib.request.urlopen(url, timeout=30) as resp, open(tmp, "wb") as f:
+        total = getattr(resp, "getheader", lambda h: None)("Content-Length")
+        if total: print("大小: %.1f MB" % (int(total) / 1048576))
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk: break
+            f.write(chunk)
+    tmp.replace(dest)
+    return dest
+
 def tag_version(tag): return tag.lstrip("vV")
 def ver_key(v): return [int(x) for x in re.findall(r"\d+", v)] or [0]
 
@@ -203,19 +372,60 @@ def save_apps(apps):
     APPS_FILE.parent.mkdir(parents=True, exist_ok=True)
     APPS_FILE.write_text(json.dumps(apps, indent=2, sort_keys=True) + "\n")
 
+def _normkey(s):
+    # 归一化: 忽略大小写和 - _ . 便于 "motrixnext" 匹配 "motrix-next"
+    return re.sub(r"[-_.]", "", str(s)).lower()
+
+def _choose(cands, token):
+    print("找到多个匹配 %r 的应用:" % token)
+    for i, (n, cfg) in enumerate(cands, 1):
+        inst = ("  [已安装 %s]" % STATE[n]["version"]) if n in STATE else ""
+        print("  %d) %-26s %s%s" % (i, n, cfg.get("repo", "?"), inst))
+    while True:
+        try:
+            r = input("选择 [1-%d] (回车取消): " % len(cands)).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not r: return None
+        if r.isdigit() and 1 <= int(r) <= len(cands):
+            return cands[int(r) - 1]
+        print("无效输入, 请输入数字")
+
 def resolve(token, apps):
-    """token -> (name, cfg, auto)。auto=True 表示这是从未 add 过的 owner/repo。"""
+    # 1. 精确: 应用名 (apps.json 键)
     if token in apps: return token, apps[token], False
+    # 2. 精确: owner/repo
     if "/" in token:
         repo = token.strip("/")
         name = repo.split("/")[-1]
         if name in apps and apps[name].get("repo") == repo:
             return name, apps[name], False
-        return name, {"repo": repo, "arch": MACHINE}, True
-    if token in STATE:
+    # 3. 已安装应用名 (apps.json 里可能已删)
+    if token in STATE and STATE[token].get("repo"):
         rec = STATE[token]
         cfg = {k: rec[k] for k in ("repo", "type", "bins", "arch") if rec.get(k)}
-        if cfg.get("repo"): return token, cfg, False
+        return token, cfg, False
+    # 4. 模糊: 忽略大小写/连字符/下划线/点, 应用名或 repo slug 的子串
+    t, tn = token.lower(), _normkey(token)
+    if len(tn) >= 2:
+        cands, seen = [], set()
+        for n, cfg in apps.items():
+            repo = (cfg.get("repo") or "")
+            slug = repo.split("/")[-1]
+            if (t in n.lower() or t in repo.lower()
+                    or tn in _normkey(n) or tn in _normkey(slug)):
+                if n not in seen:
+                    seen.add(n); cands.append((n, cfg))
+        if len(cands) > 1:
+            pick = _choose(cands, token)
+            if pick is None: die("已取消")
+            return pick[0], pick[1], False
+        if len(cands) == 1:
+            return cands[0][0], cands[0][1], False
+    # 5. owner/repo 推测 (从未 add 过, auto_add)
+    if "/" in token:
+        repo = token.strip("/")
+        return repo.split("/")[-1], {"repo": repo, "arch": MACHINE}, True
     die("无法识别 %r: 不是 apps.json 中的应用, 也不是已安装应用或 owner/repo 形式" % token)
 
 def load_state():
@@ -278,7 +488,22 @@ def install_tar(name, cfg, tag, asset, archive):
     app_dir = DATA_DIR / name / tag_version(tag)
     if app_dir.exists(): shutil.rmtree(app_dir)
     app_dir.mkdir(parents=True)
-    with tarfile.open(archive, "r:*") as t: safe_extract(t, app_dir)
+    if str(archive).lower().endswith(".zip"):
+        import zipfile
+        with zipfile.ZipFile(archive) as z:
+            dest = app_dir.resolve()
+            for m in z.namelist():
+                p = (app_dir / m).resolve()
+                if not str(p).startswith(str(dest) + os.sep):
+                    die("压缩包内存在不安全路径: %s" % m)
+            z.extractall(app_dir)
+        DOCS = {"readme", "license", "changelog", "notice", "authors", "copying",
+                "news", "todo", "install", "thanks"}
+        for p in app_dir.rglob("*"):
+            if p.is_file() and "." not in p.name and p.name.lower() not in DOCS:
+                p.chmod(0o755)
+    else:
+        with tarfile.open(archive, "r:*") as t: safe_extract(t, app_dir)
 
     bins = cfg.get("bins") or detect_bins(app_dir)
     if not bins:
@@ -303,7 +528,7 @@ def install_tar(name, cfg, tag, asset, archive):
             if v.name != tag_version(tag): shutil.rmtree(v, ignore_errors=True)
 
     STATE[name] = {"version": tag_version(tag), "tag": tag, "asset": asset["name"],
-                   "type": "tar.gz", "dir": str(app_dir), "bins": bins, "links": links,
+                   "type": asset_type(asset["name"]) or "tar.gz", "dir": str(app_dir), "bins": bins, "links": links,
                    "desktops": [desktop] if desktop else [],
                    "services": [service] if service else []}
 
@@ -335,6 +560,7 @@ def save_auto_app(name, cfg):
     if rec.get("type") and rec["type"] != "tar.gz": entry["type"] = rec["type"]
     if cfg.get("arch"): entry["arch"] = cfg["arch"]
     if rec.get("bins"): entry["bins"] = rec["bins"]
+    if cfg.get("filter"): entry["filter"] = cfg["filter"]
     apps = json.loads(APPS_FILE.read_text()) if APPS_FILE.exists() else {}
     apps[name] = entry
     save_apps(apps)
@@ -343,7 +569,7 @@ def save_auto_app(name, cfg):
 def install_app(name, cfg, release=None, auto_add=False):
     release = release or get_latest_release(cfg["repo"])
     tag = release["tag_name"]
-    asset = pick_asset(release, cfg)
+    asset = pick_asset(release, cfg, name)
     print("[%s] %s -> %s (%.1f MB)" % (name, tag, asset["name"], asset.get("size", 0) / 1e6))
     dest = CACHE_DIR / ("%s-%s" % (name, asset["name"]))
     download(asset["browser_download_url"], dest)
@@ -353,7 +579,8 @@ def install_app(name, cfg, release=None, auto_add=False):
     elif t == "appimage": install_appimage(name, cfg, tag, asset, dest)
     else: install_tar(name, cfg, tag, asset, dest)
 
-    STATE[name].update({"repo": cfg["repo"], "arch": cfg.get("arch")})
+    STATE[name].update({"repo": cfg["repo"], "arch": cfg.get("arch"),
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     save_state()
     if auto_add: save_auto_app(name, cfg)
     print("[%s] 安装完成: %s" % (name, tag_version(tag)))
@@ -460,29 +687,69 @@ def cmd_remove(args):
         save_state()
         print("[%s] 已卸载" % name)
 
+def _dw(s):
+    # 字符串的终端显示宽度 (东亚宽字符计 2 列)
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
+
+def _pad(s, width):
+    # 按显示宽度补空格 (width 已含列间分隔), 保证下一列起始位置一致
+    return str(s) + " " * (width - _dw(s))
+
+def _cols(rows):
+    # 每列宽度 = 列内容最大显示宽度 + 1 (分隔空格)
+    if not rows: return []
+    return [max(_dw(r[i]) for r in rows) + 1 for i in range(len(rows[0]))]
+
+def _table(rows):
+    ws = _cols(rows)
+    return ["  " + "".join(_pad(c, ws[i]) if i < len(ws) - 1 else str(c)
+                           for i, c in enumerate(r)) for r in rows]
+
 def cmd_list(_a):
     apps = load_apps()
-    installed = sorted(STATE)
-    available = [n for n in sorted(apps) if n not in STATE]
-    if not installed and not available:
+    items = []
+    for n in STATE:
+        rec = STATE[n]
+        items.append((rec.get("repo") or apps.get(n, {}).get("repo") or n, rec, True))
+    for n in sorted(apps):
+        if n in STATE: continue
+        items.append((apps[n].get("repo") or n, None, False))
+    items.sort(key=lambda it: (not it[2], it[0].lower()))
+    if not items:
         print("没有应用。用 gri add <owner/repo> 或 gri <owner/repo> 安装。"); return
-    if installed:
-        print("已安装:")
-        for n in installed:
-            r = STATE[n]
-            print("  %-20s %-10s %-9s %s" % (n, r.get("version", "?"), r.get("type", "?"),
-                                             r.get("repo") or r.get("asset", "?")))
-    if available:
-        print("未安装:")
-        for n in available:
-            print("  %-20s %s" % (n, apps[n].get("repo", "?")))
 
+    TYPE_LABEL = {"tar.gz": "archive", "zip": "archive", "appimage": "appimage", "rpm": "rpm"}
+    def _mtime(p):
+        try: return datetime.fromtimestamp(Path(p).stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError: return "-"
+
+    rows = [("REPO/ID", "VERSION", "TYPE", "UPDATED", "SOURCE", "STATUS")]
+    for repo, rec, inst in items:
+        if inst:
+            rows.append((repo,
+                         rec.get("version") or "-",
+                         TYPE_LABEL.get(rec.get("type"), rec.get("type") or "-"),
+                         rec.get("updated_at") or _mtime(rec.get("dir", "")),
+                         "repo" if rec.get("repo") else "-",
+                         "已安装"))
+        else:
+            rows.append((repo, "-", "-", "-", "-", "未安装"))
+
+    ws = _cols(rows)
+    def _line(r):
+        return "  " + "".join(_pad(c, ws[i]) if i < len(ws) - 1 else str(c)
+                              for i, c in enumerate(r))
+    head = _line(rows[0])
+    print(head)
+    print("  " + "-" * _dw(head))
+    for r in rows[1:]:
+        print(_line(r))
 def cmd_download(args):
     apps = load_apps()
     for token in args.names:
         name, cfg, _ = resolve(token, apps)
         rel = get_latest_release(cfg["repo"])
-        asset = pick_asset(rel, cfg)
+        asset = pick_asset(rel, cfg, name)
         print("[%s] %s -> %s (%.1f MB)" % (name, rel["tag_name"], asset["name"],
                                            asset.get("size", 0) / 1e6))
         download(asset["browser_download_url"], Path.cwd() / asset["name"])
@@ -495,7 +762,7 @@ def cmd_add(args):
         if not auto:
             print("[%s] 已存在于 apps.json, 跳过" % name); continue
         rel = get_latest_release(cfg["repo"])
-        asset = pick_asset(rel, cfg)
+        asset = pick_asset(rel, cfg, name)
         cfg["type"] = asset_type(asset["name"]) or "tar.gz"
         apps[name] = cfg
         print("[%s] %s -> %s (type=%s), 写入 apps.json (未安装)"
