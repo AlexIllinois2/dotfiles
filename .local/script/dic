@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译）
+
+用法:
+  ./dic                 启动 GUI（启动时读取一次划选内容并翻译，之后手动输入回车翻译）
+  ./dic -t "<content>"  命令行查词/翻译
+
+依赖:
+  pip install requests lxml FreeSimpleGUIQt mdict_mquery
+  （FreeSimpleGUIQt 缺失时自动回退 Tk 版 FreeSimpleGUI）
+"""
+import sys, os, re, glob, shutil, sqlite3, platform, subprocess
+import requests
+
+# ============================================================
+# 渲染层（原 render.py）
+# ============================================================
+from lxml import html as lh
+
+NL, IND = '\x00', '\x02'   # 有意换行/缩进哨兵, 空白清洗后再还原
+
+NOISE = {
+    'script', 'style', 'link', 'head', 'symbol', 'xsymb', 'img', 'hkey',
+    'topic', 'ftindex', 'fthzmark', 'fthzindex', 'xhtml', 'sdsymb',
+    'audio-wr', 'audio', 'audio-gbs-liju', 'audio-uss-liju',
+    'audio-brs-liju', 'audio-ams-liju', 'un',
+}
+# 在 NOISE 基础上追加要丢弃的交叉引用/同义词噪音
+RENDER_NOISE_EXTRA = {'xr-g', 'xr-gs', 'cf-blk', 'cf', 'syn-g-blk', 'syn-g'}
+BOLD = {'h', 'idm', 'pv', 'shcut', 'cf'}
+RESET = {
+    'pos-g': True, 'pv-blk': False, 'pv-g-blk': False, 'idm-blk': False,
+    'idm-gs-blk': False, 'subentry-g': False, 'boxblock': False,
+}
+
+
+POS_CN = {
+    'verb': '动词', 'noun': '名词', 'adjective': '形容词', 'adverb': '副词',
+    'exclamation': '感叹词', 'preposition': '介词', 'conjunction': '连词',
+    'pronoun': '代词', 'determiner': '限定词', 'number': '数词',
+    'modal verb': '情态动词', 'auxiliary verb': '助动词',
+    'v.': '动词', 'n.': '名词', 'adj.': '形容词', 'adv.': '副词',
+    'excl.': '感叹词', 'prep.': '介词', 'conj.': '连词', 'pron.': '代词',
+    'det.': '限定词', 'num.': '数词', 'modal v.': '情态动词', 'aux. v.': '助动词',
+}
+POS = {}
+
+INFL_CN = [
+    ('past participle', '过去分词'), ('past simple', '过去式'),
+    ('-ing form', '现在分词'), ('present simple - he', '三单'),
+    ('present simple', '原形'), ('plural', '复数'), ('third person', '三单'),
+]
+
+RENDER_NOISE_EXTRA = {
+    'xr-g', 'xr-gs', 'cf-blk', 'cf', 'syn-g-blk', 'syn-g', 'syn-gs',
+    'lb-g', 'lb', 'lmb',       # language bank 语料库
+    'symbol', 'un', 'unx-g',
+}
+
+# 正文行走时直接跳过的标签(内容已单独提取或纯噪音)
+_SKIP_TAGS = {'h', 'phon', 'pos', 'brelabel', 'namelabel',
+              'pron-g', 'vpform', 'infl', 'v-g'}
+
+
+def _norm(tag):
+    if not isinstance(tag, str):
+        return ''
+    return tag[7:] if tag.startswith('xhtml:') else tag
+
+
+def _norm_phon(p):
+    """音标补斜杠: 这个包里斜杠是独立节点, phon 取出来是裸 IPA"""
+    p = (p or '').strip()
+    if p and not p.startswith('/'):
+        p = '/' + p.strip('/') + '/'
+    return p
+
+
+def _infl_cn(name):
+    low = name.lower()
+    for k, v in INFL_CN:
+        if k in low:
+            return v
+    return name
+
+
+def render(html_text, width=76, bold=True):
+    root = lh.fromstring(html_text)
+
+    # ---- 1. 提取词形变化表: 以 vpform 为锚, 父节点即一条变形记录 ----
+    infl_rows = []
+    for vp in list(root.iter()):
+        if _norm(vp.tag) != 'vpform':
+            continue
+        p = vp.getparent()
+        if p is None:
+            continue
+        form = (vp.text_content() or '').strip()
+        hw = ph = ''
+        for el in p.iter():
+            t = _norm(el.tag)
+            if t == 'h' and not hw:
+                hw = (el.text_content() or '').strip()
+            elif t == 'phon' and not ph:
+                ph = (el.text_content() or '').strip()
+        if form and (hw or ph):
+            infl_rows.append((_infl_cn(form), hw, _norm_phon(ph)))
+        try:
+            p.drop_tree()
+        except Exception:
+            pass
+
+    # ---- 2. 清噪音 ----
+    noise = set(NOISE) | RENDER_NOISE_EXTRA
+    for el in list(root.iter()):
+        t = _norm(el.tag)
+        if t in noise:
+            try:
+                el.drop_tree()
+            except Exception:
+                pass
+        elif t == 'div' and 'cixing_tiaozhuan' in (el.get('class') or ''):
+            try:
+                el.drop_tree()
+            except Exception:
+                pass
+    for tag in ('audio-gb', 'audio-us', 'pron-g', 'audio'):
+        for el in list(root.iter(tag)):
+            try:
+                el.drop_tag()
+            except Exception:
+                pass
+
+    # ---- 3. 词头 + 音标 (只取第一个 top-g) ----
+    word, prons = '', []
+    for topg in root.iter():
+        if _norm(topg.tag) != 'top-g':
+            continue
+        label = None
+        for el in topg.iter():
+            t = _norm(el.tag)
+            cls = (el.get('class') or '')
+            if t == 'h' and not word:
+                word = (el.text_content() or '').strip()
+            elif t == 'brelabel' or 'bre' in cls.split():
+                label = 'BrE'
+            elif t == 'namelabel' or 'name' in cls.split():
+                label = 'NAmE'
+            elif t == 'phon' and label:
+                ph = _norm_phon((el.text_content() or '').strip())
+                if ph and (label, ph) not in prons:
+                    prons.append((label, ph))
+        break
+
+    head = []
+    if word:
+        head.append('单词：%s' % word)
+        if prons:
+            head.append('音标：' + '　｜　'.join(
+                '%s %s' % (lab, ph) for lab, ph in prons))
+    if infl_rows:
+        head.append('词形变化：')
+        for name, w, ph in infl_rows:
+            head.append('    %s：%s%s' % (name, w, (' ' + ph) if ph else ''))
+
+    # ---- 4. 正文行走 ----
+    out_lines = []
+    cur = {'ind': 4, 'chunks': [], 'chn': []}
+    st = {'sn': 0, 'num': True, 'top': 0}
+    sections = set()   # 已打印过的栏目标题, 防重复
+
+    def B(t):
+        return '\033[1m' + t + '\033[0m' if bold else t
+
+    def add(s):
+        cur['chunks'].append(s)
+
+    def flush():
+        text = re.sub(r'\s+', ' ', ''.join(cur['chunks'])).strip()
+        if cur['chn']:
+            cn = '；'.join(cur['chn'])
+            text = cn + ('　' + text if text else '')
+        if text:
+            out_lines.append(' ' * cur['ind'] + text)
+        cur['chunks'], cur['chn'] = [], []
+
+    def blank():
+        if out_lines and out_lines[-1] != '':
+            out_lines.append('')
+
+    def walk(el):
+        tag = _norm(el.tag)
+        if tag in noise:
+            return
+        # 斜杠等纯符号节点(独立 span), 跳过
+        cls = (el.get('class') or '').split()
+        if any('slash' in c for c in cls):
+            return
+        if tag == 'top-g':
+            st['top'] += 1
+            if st['top'] > 1:
+                flush()
+                blank()
+            for c in el:
+                walk(c)
+            flush()
+            return
+        if tag in _SKIP_TAGS:
+            return
+        if tag == 'br':
+            flush()
+            return
+        if tag in RESET:
+            st['sn'], st['num'] = 0, RESET[tag]
+
+        if tag == 'pos-g':
+            p = ''
+            for c in el.iter():
+                if _norm(c.tag) == 'pos':
+                    p = (c.text_content() or '').strip().lower()
+                    break
+            flush()
+            blank()
+            if p:
+                key = POS.get(p, p)
+                out_lines.append('%s (%s)：' % (POS_CN.get(key, key), key))
+            st['sn'], st['num'], cur['ind'] = 0, True, 4
+            return
+
+        if tag == 'sn-g':
+            flush()
+            cur['ind'] = 4
+            if st['num']:
+                st['sn'] += 1
+                add('%d. ' % st['sn'])
+            # 注意: 不 return, 继续走子节点取释义/例句
+
+        elif tag == 'shcut':   # 主题小标题
+            t = (el.text_content() or '').strip()
+            if t:
+                flush()
+                blank()
+                out_lines.append('  ◆ ' + B(t))
+                cur['ind'] = 4
+            return
+
+        elif tag == 'x-g-blk':
+            flush()
+            cur['ind'] = 6
+
+        elif tag in ('pv-blk', 'pv-g-blk'):
+            flush()
+            blank()
+            if tag == 'pv-blk' and 'pv' not in sections:
+                out_lines.append('短语动词 (Phrasal Verbs)：')
+                sections.add('pv')
+            cur['ind'] = 6
+            # 不 return, 继续走子节点
+
+        elif tag in ('idm-blk', 'idm-gs-blk'):
+            flush()
+            blank()
+            if 'idm' not in sections:
+                out_lines.append('常用习语 (Idioms)：')
+                sections.add('idm')
+            cur['ind'] = 6
+            # 不 return
+
+        elif tag in ('pv', 'idm'):   # 短语/习语词条头
+            t = (el.text_content() or '').strip()
+            if t:
+                flush()
+                blank()
+                out_lines.append('    · ' + B(t))
+                cur['ind'] = 6
+            return   # 头已用 text_content 提取, 跳过自身子树
+
+        elif tag == 'x-g':   # 例句: 英文在前, 全译括号在后
+            flush()
+            xs, chns = [], []
+            for sub in el.iter():
+                t2 = _norm(sub.tag)
+                if t2 == 'x':
+                    xs.append((sub.text_content() or '').strip())
+                elif t2 == 'chn':
+                    chns.append((sub.text_content() or '').strip())
+            eng = ' '.join(x for x in xs if x) or (el.text_content() or '').strip()
+            cn = '；'.join(c for c in chns if c)
+            cur['ind'] = 6
+            add('· ' + eng + (('　（%s）' % cn) if cn else ''))
+            flush()
+            return
+
+        elif tag == 'chn':   # 释义中文: 缓存, flush 时前置
+            t = (el.text_content() or '').strip()
+            if t:
+                cur['chn'].append(t)
+            return
+
+        elif tag == 'gram':
+            t = (el.text_content() or '').strip()
+            if t:
+                add('(%s) ' % t)
+            return
+
+        elif tag == 'gram-blk':
+            for c in el:
+                walk(c)
+            return
+
+        elif tag == 'li':
+            flush()
+            cur['ind'] += 2
+            add('- ')
+            for c in el:
+                walk(c)
+            flush()
+            cur['ind'] -= 2
+            return
+
+        if el.text:
+            add(el.text)
+        for c in el:
+            walk(c)
+            if c.tail:
+                add(c.tail)
+
+    for c in root:
+        walk(c)
+    flush()
+
+    # ---- 5. 组装 + 折行(保留缩进) ----
+    parts = head + ([''] if head and out_lines else []) + out_lines
+    out = []
+    for line in parts:
+        ind = re.match(r'^( *)', line).group(1)
+        if len(line) <= width:
+            out.append(line)
+            continue
+        words, buf = line.split(' '), ''
+        for w in words:
+            if buf and len(buf) + 1 + len(w) > width:
+                out.append(buf)
+                buf = ind + '  ' + w
+            else:
+                buf = (buf + ' ' + w) if buf else (ind + w)
+        if buf:
+            out.append(buf)
+    return '\n'.join(out)
+
+
+
+# ============================================================
+# 多分卷 MDD 查询层（原 multimdd.py）
+# ============================================================
+class MultiMDD:
+    def __init__(self, builder):
+        self.builder = builder
+        stem = os.path.splitext(builder._mdx_file)[0]
+        seen, vols = set(), []
+        # <词干>.mdd 与 <词干>.N.mdd, 按 realpath 去重(兼容符号链接)
+        for p in [stem + ".mdd"] + sorted(glob.glob(glob.escape(stem) + ".*.mdd")):
+            if os.path.isfile(p):
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    vols.append((p, p + ".db"))
+        self.vols = vols
+        self._mounted = None
+
+    def _mount(self, vol):
+        if self._mounted is vol:
+            return
+        mdd, db = vol
+        b = self.builder
+        b._mdd_file = mdd
+        b._mdd_db = db
+        if not os.path.isfile(db):
+            print(f" [构建] MDD 索引(一次性): {os.path.basename(db)}")
+            b._make_mdd_index(db)
+        self._mounted = vol
+
+    def lookup(self, ref, candidates):
+        # 第一轮: 精确候选, 逐卷尝试
+        for vol in self.vols:
+            self._mount(vol)
+            for cand in candidates(ref):
+                try:
+                    res = self.builder.mdd_lookup(cand)
+                except Exception:
+                    continue
+                if res:
+                    v = res[0]
+                    return v.encode() if isinstance(v, str) else bytes(v)
+        # 第二轮: 后缀兜底, 每卷扫 get_mdd_keys()
+        suffix = "/" + str(ref).replace("\\", "/").lstrip("/")
+        for vol in self.vols:
+            self._mount(vol)
+            try:
+                keys = self.builder.get_mdd_keys()
+            except Exception:
+                continue
+            for k in keys:
+                if isinstance(k, (tuple, list)) and k:
+                    k = k[0]
+                if isinstance(k, bytes):
+                    k = k.decode("utf-8", "ignore")
+                else:
+                    k = str(k)
+                if k.replace("\\", "/").endswith(suffix):
+                    try:
+                        res = self.builder.mdd_lookup(k)
+                    except Exception:
+                        continue
+                    if res:
+                        v = res[0]
+                        return v.encode() if isinstance(v, str) else bytes(v)
+        return None
+
+
+_POOL = {}
+
+
+def multi_mdd_lookup(builder, ref, candidates):
+    key = id(builder)
+    if key not in _POOL:
+        _POOL[key] = MultiMDD(builder)
+    return _POOL[key].lookup(ref, candidates)
+
+
+# ============================================================
+# 词典门面（原 dictapi.py）
+# ============================================================
+import mdict_mquery
+if not hasattr(mdict_mquery, "version"):   # 包内 bug: NameError: version
+    mdict_mquery.version = getattr(mdict_mquery, "__version__", "unknown")
+from mdict_mquery import IndexBuilder
+
+DICT_DIR = os.path.expanduser(
+    os.environ.get("GOLDENDICT_DIR", "~/.local/share/golden-dict/Oxford"))
+AUDIO_DIR = "/tmp/dic/audio"
+AUDIO_PATTERNS = [
+    re.compile(r'sound://([^"\'\s>\\]+)'),
+    re.compile(r'data-src-mp3=["\']([^"\']+)'),
+    re.compile(r'href=["\']([^"\']*?\.mp3)'),
+]
+
+_BUILDERS = {}
+
+
+def _get_builder(mdx):
+    if mdx not in _BUILDERS:
+        try:
+            _BUILDERS[mdx] = IndexBuilder(mdx)
+        except sqlite3.OperationalError:
+            # 缓存损坏 → 清理重建
+            _purge_generated(mdx)
+            _BUILDERS[mdx] = IndexBuilder(mdx)
+    return _BUILDERS[mdx]
+
+
+def _purge_generated(m):
+    """按后缀白名单清理包生成的索引/缓存, 绝不动 .mdx/.mdd 源文件"""
+    stem = os.path.splitext(m)[0]
+    whitelist = {"index", "db", "idx", "cache", "pickle", "pkl", "keys",
+                 "sqlite", "sqlite3", "mquery"}
+    for base in (m, stem):
+        for p in sorted(glob.glob(base + ".*")):
+            if p in (m, stem + ".mdx", stem + ".mdd"):
+                continue
+            if os.path.splitext(p)[1].lstrip(".").lower() in whitelist:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+def _to_str(x):
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (bytes, bytearray)):
+        for e in ("utf-8", "utf-16-le", "gb18030"):
+            try:
+                return bytes(x).decode(e)
+            except UnicodeDecodeError:
+                pass
+    return str(x)
+
+
+def _strip_dup(html):
+    """OALD9 的 aunbox 是 unbox 的锚点副本(GoldenDict 靠 CSS 隐藏)。
+    只删除确有相同文本 unbox 孪生的 aunbox, 孤立 aunbox 保留。"""
+    try:
+        root = lh.fromstring(html)
+    except Exception:
+        return html
+    tag = lambda el: el.tag.split(":")[-1].lower()
+    text = lambda el: "".join(el.itertext())
+    removed = 0
+    for el in list(root.iter()):
+        if tag(el) != "aunbox":
+            continue
+        p = el.getparent()
+        if p is None:
+            continue
+        twin = any(tag(s) == "unbox" and text(s) == text(el) for s in p if s is not el)
+        if twin:
+            p.remove(el)
+            removed += 1
+    return lh.tostring(root, encoding="unicode") if removed else html
+
+
+def _headword_chn(html):
+    """取第一个不在 unbox/aunbox 内的 chn 文本, 作为词头中文摘要"""
+    try:
+        root = lh.fromstring(html)
+    except Exception:
+        return ""
+    tag = lambda el: el.tag.split(":")[-1].lower()
+    for el in root.iter():
+        if tag(el) != "chn":
+            continue
+        p, inside = el.getparent(), False
+        while p is not None and getattr(p, "tag", None):
+            if tag(p) in ("unbox", "aunbox"):
+                inside = True
+                break
+            p = p.getparent()
+        if inside:
+            continue
+        t = " ".join(el.itertext()).strip()
+        if t:
+            return t
+    return ""
+
+
+def _candidates(ref):
+    r = ref.replace("\\", "/").lstrip("/")
+    return ["/" + r, "\\" + r, r]
+
+
+def _save_audio(data, ref):
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    out = os.path.join(AUDIO_DIR, os.path.basename(ref.replace("\\", "/")))
+    if not (os.path.exists(out) and os.path.getsize(out) == len(data)):
+        with open(out, "wb") as f:
+            f.write(data)
+    return out
+
+
+def lookup(word, bold=True):
+    mdx_files = sorted(glob.glob(
+        os.path.join(DICT_DIR, "**", "*.mdx"), recursive=True))
+    r = {"word": word, "found": False, "text": None, "audio_refs": [],
+         "dict": None}
+    if not mdx_files:
+        return r
+    for mdx in mdx_files:
+        builder = _get_builder(mdx)
+        results = builder.mdx_lookup(word)
+        if not results:
+            results = builder.mdx_lookup(word.lower())   # 大小写兜底
+        if not results:
+            continue
+        html = _to_str(results[0])
+        r.update(found=True, dict=os.path.basename(mdx), _mdx=mdx)
+        r["text"] = render(_strip_dup(html), bold=bold)
+        import glob as _glob
+        _css_parts = []
+        for _cp in sorted(_glob.glob(os.path.join(
+                os.path.dirname(mdx), "**", "*.css"),
+                recursive=True)):
+            try:
+                with open(_cp, encoding="utf-8",
+                          errors="ignore") as _f:
+                    _css_parts.append(_f.read())
+            except OSError:
+                pass
+        r["css"] = "\n\n".join(_css_parts)
+        r["_html"] = _strip_dup(html)
+        _hw = _headword_chn(html)
+        if _hw:
+            _hw = re.sub(r"（[^）]*）|\([^)]*\)", "", _hw).strip(" ；;，,")
+            if len(_hw) > 30:
+                _hw = _hw[:30] + "…"
+        if _hw:
+            _lines = r["text"].split("\n")
+            _lines[0] = _lines[0].rstrip() + " 【" + _hw + "】"
+            r["text"] = "\n".join(_lines)
+        r["audio_refs"] = _parse_audio_refs(html)   # 只记引用, 不解压
+        break   # 命中第一个词典即止
+    return r
+
+
+def _parse_audio_refs(html):
+    seen, refs = set(), []
+    for pat in AUDIO_PATTERNS:
+        for m in pat.finditer(html):
+            ref = m.group(1).strip()
+            if ref.startswith("sound://"):
+                ref = ref[len("sound://"):]
+            if not ref or ref in seen:
+                continue
+            base = os.path.basename(ref)
+            if base.startswith("_") or ("__" in base and any(
+                    t in base for t in ("gbs", "uss", "brs", "ams"))):
+                continue   # 例句音包未下载, 跳过
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
+def extract_audio(mdx, ref):
+    """点播放才解压单个 ref; 目录里只保留当前这一个"""
+    data = multi_mdd_lookup(_get_builder(mdx), ref, _candidates)
+    if not data:
+        return None
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    name = os.path.basename(ref.replace("\\", "/"))
+    out = os.path.join(AUDIO_DIR, name)
+    if os.path.exists(out) and os.path.getsize(out) == len(data):
+        return out
+    # 幂等: 已解压直接复用
+    for f in os.listdir(AUDIO_DIR):
+        if f != name:   # 只保留当前播放的这一个
+            try:
+                os.remove(os.path.join(AUDIO_DIR, f))
+            except OSError:
+                pass
+    with open(out, "wb") as fp:
+        fp.write(data)
+    return out
+
+
+def get_playable(word, variant="gb"):
+    """查词并解压指定发音变体("gb"英音/"us"美音), 返回 mp3 路径或 None
+    不走 render(), 纯查索引, 开销极小"""
+    mdx_files = sorted(glob.glob(
+        os.path.join(DICT_DIR, "**", "*.mdx"), recursive=True))
+    for mdx in mdx_files:
+        b = _get_builder(mdx)
+        results = b.mdx_lookup(word) or b.mdx_lookup(word.lower())
+        if not results:
+            continue
+        html = _to_str(results[0])
+        for ref in _parse_audio_refs(html):
+            if ("_%s_" % variant) in os.path.basename(ref).lower():
+                return extract_audio(mdx, ref)
+    return None
+
+
+# ============================================================
+# Bing 在线翻译（免 token 端点）
+# ============================================================
+BING_URL = "https://edge.microsoft.com/translate/translatetext"
+EDGE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
+
+
+def translate_text(text, target_lang="zh-Hans"):
+    if not text or not text.strip():
+        return ""
+    url = f"{BING_URL}?isEnterpriseClient=false&to={target_lang}"
+    headers = {"Content-Type": "application/json", "User-Agent": EDGE_UA}
+    try:
+        # body 是纯字符串数组 [text]，非对象；source 不传，服务端自动检测
+        resp = requests.post(url, json=[text], headers=headers, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        if (isinstance(result, list) and result and "translations" in result[0]):
+            return result[0]["translations"][0]["text"].strip()
+        return "解析响应失败"
+    except requests.exceptions.RequestException as e:
+        return f"网络请求失败: {e}"
+
+
+# ============================================================
+# PRIMARY 选择槽读取（跨平台兼容）
+# ============================================================
+_OS = platform.system()
+
+
+def _run_cmd(args):
+    """安全执行外部命令，返回 stdout 或 None"""
+    try:
+        p = subprocess.run(args, capture_output=True, timeout=2)
+        if p.returncode == 0:
+            return p.stdout.decode("utf-8", errors="ignore")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def get_primary_selection():
+    """跨平台读取 PRIMARY 选择槽，返回 (text, source_desc)，失败返回 ("", "")"""
+    if _OS == "Linux":
+        # Wayland 优先检测（wl-paste --primary）
+        if shutil.which("wl-paste"):
+            text = _run_cmd(["wl-paste", "--primary", "--no-newline"])
+            if text is not None:
+                return text, "wl-paste (Wayland)"
+        # X11 检测（xclip 优先，xsel 回退）
+        if shutil.which("xclip"):
+            text = _run_cmd(["xclip", "-o", "-selection", "primary"])
+            if text is not None:
+                return text, "xclip (X11)"
+        if shutil.which("xsel"):
+            text = _run_cmd(["xsel", "-o", "-p"])   # -p 即 primary
+            if text is not None:
+                return text, "xsel (X11)"
+        # Qt 兜底：QClipboard.Selection 属性即 PRIMARY
+        try:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtGui import QClipboard
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication([])
+            text = app.clipboard().text(QClipboard.Selection)
+            if text:
+                return text, "Qt Selection"
+        except ImportError:
+            pass
+        return "", ""
+    elif _OS == "Darwin":
+        # macOS 无 PRIMARY，回退 pbpaste 读普通剪贴板
+        text = _run_cmd(["pbpaste"])
+        return (text or ""), "pbpaste (macOS 回退)"
+    elif _OS == "Windows":
+        return "", ""   # Windows 无 PRIMARY，提示后返回空
+    return "", ""
+
+
+# ============================================================
+# GUI（原 dic.py 主程序）
+# ============================================================
+def run_gui():
+    try:
+        import FreeSimpleGUIQt as sg
+        using_qt = True
+    except ImportError:
+        import FreeSimpleGUI as sg
+        using_qt = False
+
+    _cur = {"word": None}   # 当前本地词条(供发音按钮使用)
+
+    def _is_single_word(q):
+        q = q.strip()
+        if not q or len(q.split()) != 1:
+            return False
+        return not re.search(r"[.!?,;:?。！？，]", q)   # 句末标点→当句子
+
+    def _play(path):
+        for p in ("mpv", "ffplay", "cvlc"):
+            if shutil.which(p):
+                args = {
+                    "mpv":   [p, "--no-video", "--really-quiet", path],
+                    "ffplay": [p, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    "cvlc":  [p, "--play-and-exit", "--intf", "dummy", path],
+                }[p]
+                subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return True
+        return False
+
+    def do_translate(text):
+        """分流: 单词→本地词典(可发音), 未收录/短语句子→Bing 在线"""
+        _cur["word"] = None
+        if _is_single_word(text):
+            r = lookup(text.strip(), bold=False)
+            if r["found"]:
+                window["-OUTPUT-"].update(r["text"] or "(渲染为空)")
+                window["-STATUS-"].update("📖 本地词典 | " + r["dict"])
+                _cur["word"] = r["word"]
+                return
+            window["-STATUS-"].update("本地未收录, 在线翻译中…")
+        window["-OUTPUT-"].update(translate_text(text))
+
+    def safe_copy_to_clipboard(text):
+        if not text or not text.strip():
+            return False
+        if hasattr(sg, "clipboard_set"):
+            try:
+                sg.clipboard_set(text)
+                return True
+            except Exception:
+                pass
+        if using_qt:
+            try:
+                from PySide6.QtWidgets import QApplication
+                QApplication.clipboard().setText(text)
+                return True
+            except Exception:
+                pass
+        return False
+
+    # ---- 布局 ----
+    layout = [
+        [sg.Text("📥 启动时翻译划选内容，之后可手动输入回车翻译",
+                 font=("微软雅黑", 12), key="-STATUS-")],
+        [sg.Multiline(key="-INPUT-", size=(60, 6), font=("微软雅黑", 11), focus=True)],
+        [sg.Text("🌐 翻译结果", font=("微软雅黑", 12))],
+        [sg.Multiline(key="-OUTPUT-", size=(60, 18), font=("微软雅黑", 11))],
+        [
+            sg.Button("🔊 英音", key="-PLAY-GB-", size=(8, 1)),
+            sg.Button("🔊 美音", key="-PLAY-US-", size=(8, 1)),
+            sg.Button("📋 复制", key="-COPY-", size=(10, 1)),
+            sg.Button("🗑️ 清空", key="-CLEAR-", size=(10, 1)),
+            sg.Button("🚪 退出", key="-EXIT-", size=(10, 1)),
+        ],
+    ]
+    window = sg.Window("划选即译 (Bing + PRIMARY)", layout,
+                       resizable=True, finalize=True,
+                       return_keyboard_events=True)
+
+    # ---- Qt 后端: 输出框原生右键菜单 (复制选中/全选) ----
+    if using_qt:
+        try:
+            from PySide6.QtWidgets import QMenu
+            from PySide6.QtGui import QAction
+            from PySide6.QtCore import Qt as _Qt
+            _w = window["-OUTPUT-"].Widget
+
+            def _show_menu(pos):
+                menu = QMenu(_w)
+                a1 = QAction("📋 复制选中", menu)
+                a1.triggered.connect(lambda: safe_copy_to_clipboard(
+                    _w.textCursor().selectedText().replace("\u2029", "\n")))
+                a2 = QAction("全选", menu)
+                a2.triggered.connect(_w.selectAll)
+                menu.addAction(a1)
+                menu.addAction(a2)
+                menu.exec(_w.mapToGlobal(pos))
+
+            _w.setContextMenuPolicy(_Qt.CustomContextMenu)
+            _w.customContextMenuRequested.connect(_show_menu)
+        except Exception as _e:
+            print("右键菜单挂载失败(不影响主功能):", _e)
+
+    # ---- 输出框选择/复制 (兼容 Tk 与 Qt 后端) ----
+    def _out_widget():
+        return window["-OUTPUT-"].Widget
+
+    def _sel_text():
+        try:   # Tk 后端
+            return _out_widget().get("sel.first", "sel.last") or ""
+        except Exception:
+            pass
+        try:   # Qt 后端
+            tc = _out_widget().textCursor()
+            return tc.selectedText().replace("\u2029", "\n")
+        except Exception:
+            return ""
+
+    def _select_all():
+        try:   # Tk 后端
+            _out_widget().tag_add("sel", "1.0", "end")
+            return
+        except Exception:
+            pass
+        try:   # Qt 后端
+            _out_widget().selectAll()
+        except Exception:
+            pass
+
+    # ---- 启动时一次性读取 PRIMARY 并翻译（之后不再监听/轮询） ----
+    initial_primary, primary_source = get_primary_selection()
+    if primary_source:
+        window["-STATUS-"].update(f"📥 已读取划选内容（源：{primary_source}）")
+    elif _OS == "Windows":
+        window["-STATUS-"].update("⚠️ Windows 无 PRIMARY 槽，请手动输入翻译")
+    if initial_primary.strip():
+        window["-INPUT-"].update(initial_primary)
+        do_translate(initial_primary)
+
+    # Qt 端口键码（16777220=Return, 16777216=Escape）
+    ENTER_KEYS = {"special 16777220", "special 16777221", "\r", "\n"}
+    ESC_KEYS = {"special 16777216", "Escape:27"}
+
+    try:
+        while True:
+            event, values = window.read()   # 阻塞式，无轮询
+            # ---- 退出分支（幂等：多路径收敛到同一 break） ----
+            if (event in (sg.WIN_CLOSED, None, "")
+                    or event == "-EXIT-" or event in ESC_KEYS):
+                break
+
+            # ---- 手动输入：回车触发翻译 ----
+            if event in ENTER_KEYS:
+                input_text = (values.get("-INPUT-", "") or "").strip()
+                if input_text:
+                    do_translate(input_text)
+                continue
+
+            # ---- 复制（幂等） ----
+            if event == "-COPY-":
+                output_text = (values.get("-OUTPUT-", "") or "").strip()
+                if output_text and safe_copy_to_clipboard(output_text):
+                    sg.popup_quick("✅ 已复制到剪贴板", auto_close_duration=0.8,
+                                   background_color="green", text_color="white")
+                else:
+                    sg.popup_quick("⛔ 复制失败或无内容", auto_close_duration=0.8,
+                                   background_color="orange", text_color="white")
+                continue
+
+            # ---- 发音（幂等） ----
+            if event in ("-PLAY-GB-", "-PLAY-US-"):
+                if _cur["word"]:
+                    path = get_playable(_cur["word"],
+                                        "gb" if event == "-PLAY-GB-" else "us")
+                    if path and _play(path):
+                        window["-STATUS-"].update("🔊 " + os.path.basename(path))
+                    else:
+                        window["-STATUS-"].update(
+                            "⛔ 无音频或缺少播放器(需 mpv/ffplay/vlc)")
+                else:
+                    window["-STATUS-"].update("当前结果无本地发音")
+                continue
+
+            if event == "复制选中":
+                t = _sel_text()
+                if t and safe_copy_to_clipboard(t):
+                    sg.popup_quick("✅ 已复制选中内容", auto_close_duration=0.8,
+                                   background_color="green", text_color="white")
+                else:
+                    sg.popup_quick("请先用鼠标拖选要复制的内容",
+                                   auto_close_duration=0.8)
+                continue
+
+            if event == "全选":
+                _select_all()
+                continue
+
+            if event == "-CLEAR-":
+                window["-INPUT-"].update("")
+                window["-OUTPUT-"].update("")
+                continue
+    finally:
+        try:
+            window.close()
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+# ============================================================
+# CLI（原 dicli.py）
+# ============================================================
+# ============================================================
+# Webview GUI（pywebview, 直接渲染词典原始 HTML）
+# ============================================================
+WEB_SHELL = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body { font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif; font-size: 15px;
+       margin: 0; line-height: 1.55; }
+#bar { position: sticky; top: 0; background: #f5f5f5; border-bottom: 1px solid #ddd;
+       padding: 8px; display: flex; gap: 6px; z-index: 9; }
+#q { flex: 1; font-size: 15px; padding: 6px 10px; border: 1px solid #ccc;
+     border-radius: 6px; }
+button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px;
+         background: #fff; cursor: pointer; }
+button:hover { background: #eee; }
+#content { padding: 14px 18px; }
+#content img { max-width: 100%; }
+a[data-sound] { text-decoration: none; cursor: pointer; }
+</style>
+<style id="dict-css"></style>
+</head>
+<body>
+<div id="bar">
+  <input id="q" value="__WORD__" placeholder="输入单词后回车…" autofocus>
+  <button onclick="doLookup()">查词</button>
+</div>
+<div id="content">__CONTENT__</div>
+<script>
+function bindSounds(root) {
+  root.querySelectorAll('[data-sound]').forEach(function (el) {
+    el.onclick = function () {
+      pywebview.api.play(el.getAttribute('data-sound'));
+    };
+  });
+}
+function applyJs(js) {
+  if (!js) return;
+  try {
+    var s = document.createElement('script');
+    s.textContent = 'try{' + js + '}catch(e){console.error(e)}';
+    document.getElementById('content').appendChild(s);
+  } catch (e) {}
+}
+function applyCss(css) {
+  var st = document.getElementById('dict-css');
+  if (st) st.textContent = css || '';
+}
+function doLookup() {
+  var w = document.getElementById('q').value.trim();
+  if (!w) return;
+  pywebview.api.lookup(w).then(function (r) {
+    if (r && r.html !== undefined) {
+      document.getElementById('content').innerHTML = r.html;
+      applyCss(r.css);
+      bindSounds(document.getElementById('content'));
+      applyJs(r.js);
+    }
+  });
+}
+document.getElementById('q').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') doLookup();
+});
+window.addEventListener('pywebviewready', function () {
+  bindSounds(document.getElementById('content'));
+});
+bindSounds(document);
+</script>
+<script>__DICTJS__</script>\n</body></html>"""
+
+OXFORD9_CSS = """
+/* ==== dic 修正层 v5: 词典自带 oalecd9.css 为主, 仅必要微调 ==== */
+pron-g-blk br { display: none !important; }
+a[data-sound] { text-decoration: none; cursor: pointer; }
+"""
+
+
+def run_gui_web():
+    """pywebview 版 GUI: 渲染词典原始 HTML + 内置/外置 CSS"""
+    try:
+        import webview
+    except ImportError:
+        print("缺少 pywebview, 请先: pip install pywebview", file=sys.stderr)
+        run_gui()
+        return
+
+    from html import escape as _esc
+
+    def _is_single_word(q):
+        q = q.strip()
+        if not q or len(q.split()) != 1:
+            return False
+        return not re.search(r"[.!?,;:?。！？，]", q)
+
+    def _prepare(h):
+        h = h.replace("<xhtml:", "<").replace("</xhtml:", "</")
+        h = re.sub(r'href=["\']sound://([^"\']+)["\']',
+                   lambda m: 'href="javascript:void(0)" data-sound="%s"'
+                   % m.group(1), h)
+        h = re.sub(r'data-src-mp3=["\']([^"\']+)["\']',
+                   lambda m: 'data-sound="%s"' % m.group(1), h)
+        return h
+
+    def _play(path):
+        for p in ("mpv", "ffplay", "cvlc"):
+            if shutil.which(p):
+                args = {
+                    "mpv":    [p, "--no-video", "--really-quiet", path],
+                    "ffplay": [p, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    "cvlc":   [p, "--play-and-exit", "--intf", "dummy", path],
+                }[p]
+                subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return True
+        return False
+
+    state = {"mdx": None, "js": ""}
+
+    def _load_js(d):
+        import glob as _glob
+        parts = []
+        for jp in sorted(_glob.glob(os.path.join(d, "**", "*.js"),
+                                   recursive=True)):
+            try:
+                with open(jp, encoding="utf-8", errors="ignore") as f:
+                    parts.append(f.read())
+            except OSError:
+                pass
+        return "\n;\n".join(parts)
+
+    def _dump(html, css):
+        if os.environ.get("DIC_DUMP"):
+            try:
+                with open("/tmp/dic_last.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                with open("/tmp/dic_last.css", "w", encoding="utf-8") as f:
+                    f.write(css)
+            except OSError:
+                pass
+
+    class Api:
+        def lookup(self, word):
+            word = (word or "").strip()
+            if not word:
+                return {"html": "", "css": ""}
+            css = OXFORD9_CSS
+            if _is_single_word(word):
+                r = lookup(word)
+                if r["found"]:
+                    state["mdx"] = r.get("_mdx")
+                    css = r.get("css", "") + "\n" + OXFORD9_CSS
+                    if not state.get("js"):
+                        state["js"] = _load_js(os.path.dirname(state["mdx"]))
+                    html = _prepare(r["_html"])
+                    _dump(html, css)
+                    return {"html": html, "css": css,
+                            "js": state.get("js", "")}
+                t = translate_text(word)
+                return {"html": "<p><b>%s</b>(本地未收录, 在线翻译)</p><p>%s</p>"
+                                % (_esc(word), _esc(t)), "css": ""}
+            return {"html": "<p>%s</p>" % _esc(translate_text(word)),
+                    "css": ""}
+
+        def play(self, ref):
+            mdx = state.get("mdx")
+            if not mdx or not ref:
+                return
+            try:
+                p = extract_audio(mdx, ref)
+            except Exception:
+                p = None
+            if p:
+                _play(p)
+
+    def _entry_page(word="", body="", css="", js=""):
+        js = js.replace("</script", "<\\/script")
+        return (WEB_SHELL
+                .replace("__WORD__", _esc(word))
+                .replace("__CONTENT__", body)
+                .replace('<style id="dict-css"></style>',
+                         '<style id="dict-css">' + css + '</style>')
+                .replace("__DICTJS__", "try{\n" + js + "\n}catch(e){}"))
+
+    initial, source = get_primary_selection()
+    body, word0, css0, js0 = "", "", OXFORD9_CSS, ""
+    if initial.strip():
+        word0 = initial.strip()
+        if _is_single_word(word0):
+            r = lookup(word0)
+            if r["found"]:
+                state["mdx"] = r.get("_mdx")
+                css0 = r.get("css", "") + "\n" + OXFORD9_CSS
+                js0 = state.get("js") or _load_js(
+                    os.path.dirname(state["mdx"]))
+                state["js"] = js0
+                body = _prepare(r["_html"])
+                _dump(body, css0)
+            else:
+                body = "<p>%s</p>" % _esc(translate_text(initial))
+        else:
+            body = "<p>%s</p>" % _esc(translate_text(initial))
+
+    webview.create_window("dic", html=_entry_page(word0, body, css0, js0),
+                          js_api=Api(), width=760, height=860)
+    webview.start()
+
+
+def run_cli(content):
+    r = lookup(content)
+    if not r["found"]:
+        # 本地未收录 → Bing 在线翻译
+        out = translate_text(content)
+        print(out)
+        return 0 if out else 1
+    print(f"--- {r['dict']} | {r['word']}\n")
+    print(r["text"])
+    for variant in ("gb", "us"):
+        p = get_playable(r["word"], variant)
+        if p:
+            print(f" 🎧 {p}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        run_gui()
+        return
+    if args[0] in ("-w", "--web"):
+        run_gui_web()
+        return
+    if args[0] in ("-t", "--text"):
+        content = " ".join(args[1:]).strip()
+        if not content:
+            print('用法: ./dic -t "<content>"', file=sys.stderr)
+            sys.exit(1)
+        sys.exit(run_cli(content))
+    if args[0] in ("-h", "--help"):
+        print("用法: ./dic            启动 GUI\n"
+              "      ./dic -t <text>  命令行查词/翻译")
+        return
+    # 兼容裸参数: ./dic word
+    sys.exit(run_cli(" ".join(args)))
+
+
+if __name__ == "__main__":
+    main()
+
