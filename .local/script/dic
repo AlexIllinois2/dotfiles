@@ -12,7 +12,9 @@ dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译）
   （FreeSimpleGUIQt 缺失时自动回退 Tk 版 FreeSimpleGUI）
 """
 import sys, os, re, glob, shutil, sqlite3, platform, subprocess
+import time
 import requests
+from pathlib import Path
 
 # ============================================================
 # 渲染层（原 render.py）
@@ -613,8 +615,26 @@ def _parse_audio_refs(html):
 
 
 def extract_audio(mdx, ref):
-    """点播放才解压单个 ref; 目录里只保留当前这一个"""
+    """点播放才解压单个 ref; 目录里只保留当前这一个。
+    精确路径失败时, 按 basename 在所有 MDD 卷里兜底匹配。"""
+    ref = str(ref).replace("\\", "/").strip().lstrip("/")
     data = multi_mdd_lookup(_get_builder(mdx), ref, _candidates)
+    if not data:
+        base = os.path.basename(ref).lower()
+        try:
+            keys = _get_builder(mdx).get_mdd_keys()
+        except Exception:
+            keys = []
+        for k in keys:
+            if isinstance(k, (tuple, list)):
+                k = k[0] if k else b""
+            if isinstance(k, bytes):
+                k = k.decode("utf-8", "ignore")
+            k = str(k)
+            if os.path.basename(k.replace("\\", "/")).lower() == base:
+                data = multi_mdd_lookup(_get_builder(mdx), k, _candidates)
+                if data:
+                    break
     if not data:
         return None
     os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -622,9 +642,8 @@ def extract_audio(mdx, ref):
     out = os.path.join(AUDIO_DIR, name)
     if os.path.exists(out) and os.path.getsize(out) == len(data):
         return out
-    # 幂等: 已解压直接复用
     for f in os.listdir(AUDIO_DIR):
-        if f != name:   # 只保留当前播放的这一个
+        if f != name:
             try:
                 os.remove(os.path.join(AUDIO_DIR, f))
             except OSError:
@@ -632,7 +651,6 @@ def extract_audio(mdx, ref):
     with open(out, "wb") as fp:
         fp.write(data)
     return out
-
 
 def get_playable(word, variant="gb"):
     """查词并解压指定发音变体("gb"英音/"us"美音), 返回 mp3 路径或 None
@@ -677,65 +695,61 @@ def translate_text(text, target_lang="zh-Hans"):
 
 
 # ============================================================
-# PRIMARY 选择槽读取（跨平台兼容）
 # ============================================================
-_OS = platform.system()
+# GUI / CLI
+# ============================================================
+
+def _is_single_word(text):
+    """单个单词才使用 WebView 词典；短语/句子使用原生 Qt。"""
+    text = (text or "").strip()
+    if not text or len(text.split()) != 1:
+        return False
+    return re.search(r"[.!?,;:?。！？，、；：！？]", text) is None
 
 
-def _run_cmd(args):
-    """安全执行外部命令，返回 stdout 或 None"""
-    try:
-        p = subprocess.run(args, capture_output=True, timeout=2)
-        if p.returncode == 0:
-            return p.stdout.decode("utf-8", errors="ignore")
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
-    return None
+def _switch_ui(text, mode):
+    """启动另一种 GUI；mode 为 web/native。"""
+    text = (text or "").strip()
+    if not text:
+        return
+    flag = "--web" if mode == "web" else "--native"
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), flag, text],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
-def get_primary_selection():
-    """跨平台读取 PRIMARY 选择槽，返回 (text, source_desc)，失败返回 ("", "")"""
-    if _OS == "Linux":
-        # Wayland 优先检测（wl-paste --primary）
-        if shutil.which("wl-paste"):
-            text = _run_cmd(["wl-paste", "--primary", "--no-newline"])
-            if text is not None:
-                return text, "wl-paste (Wayland)"
-        # X11 检测（xclip 优先，xsel 回退）
-        if shutil.which("xclip"):
-            text = _run_cmd(["xclip", "-o", "-selection", "primary"])
-            if text is not None:
-                return text, "xclip (X11)"
-        if shutil.which("xsel"):
-            text = _run_cmd(["xsel", "-o", "-p"])   # -p 即 primary
-            if text is not None:
-                return text, "xsel (X11)"
-        # Qt 兜底：QClipboard.Selection 属性即 PRIMARY
+def _play_audio(path):
+    """使用系统播放器播放本地音频。"""
+    players = (
+        ("mpv", ["mpv", "--no-video", "--really-quiet", path]),
+        ("paplay", ["paplay", path]),
+        ("aplay", ["aplay", path]),
+        ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]),
+        ("cvlc", ["cvlc", "--play-and-exit", "--intf", "dummy", path]),
+    )
+    for _, args in players:
+        if not shutil.which(args[0]):
+            continue
         try:
-            from PySide6.QtWidgets import QApplication
-            from PySide6.QtGui import QClipboard
-            app = QApplication.instance()
-            if app is None:
-                app = QApplication([])
-            text = app.clipboard().text(QClipboard.Selection)
-            if text:
-                return text, "Qt Selection"
-        except ImportError:
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
             pass
-        return "", ""
-    elif _OS == "Darwin":
-        # macOS 无 PRIMARY，回退 pbpaste 读普通剪贴板
-        text = _run_cmd(["pbpaste"])
-        return (text or ""), "pbpaste (macOS 回退)"
-    elif _OS == "Windows":
-        return "", ""   # Windows 无 PRIMARY，提示后返回空
-    return "", ""
+    return False
 
 
 # ============================================================
-# GUI（原 dic.py 主程序）
+# 原生 Qt 翻译窗口
 # ============================================================
-def run_gui():
+
+def run_gui(initial_text=None, auto_switch=True):
     try:
         import FreeSimpleGUIQt as sg
         using_qt = True
@@ -743,41 +757,36 @@ def run_gui():
         import FreeSimpleGUI as sg
         using_qt = False
 
-    _cur = {"word": None}   # 当前本地词条(供发音按钮使用)
-
-    def _is_single_word(q):
-        q = q.strip()
-        if not q or len(q.split()) != 1:
-            return False
-        return not re.search(r"[.!?,;:?。！？，]", q)   # 句末标点→当句子
-
-    def _play(path):
-        for p in ("mpv", "ffplay", "cvlc"):
-            if shutil.which(p):
-                args = {
-                    "mpv":   [p, "--no-video", "--really-quiet", path],
-                    "ffplay": [p, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-                    "cvlc":  [p, "--play-and-exit", "--intf", "dummy", path],
-                }[p]
-                subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                return True
-        return False
+    current = {"word": None}
 
     def do_translate(text):
-        """分流: 单词→本地词典(可发音), 未收录/短语句子→Bing 在线"""
-        _cur["word"] = None
+        text = (text or "").strip()
+        if not text:
+            return
+
+        if auto_switch and _is_single_word(text):
+            _switch_ui(text, "web")
+            try:
+                window.close()
+            except Exception:
+                pass
+            return
+
+        current["word"] = None
+
         if _is_single_word(text):
-            r = lookup(text.strip(), bold=False)
+            r = lookup(text, bold=False)
             if r["found"]:
                 window["-OUTPUT-"].update(r["text"] or "(渲染为空)")
                 window["-STATUS-"].update("📖 本地词典 | " + r["dict"])
-                _cur["word"] = r["word"]
+                current["word"] = r["word"]
                 return
             window["-STATUS-"].update("本地未收录, 在线翻译中…")
-        window["-OUTPUT-"].update(translate_text(text))
 
-    def safe_copy_to_clipboard(text):
+        window["-OUTPUT-"].update(translate_text(text))
+        window["-STATUS-"].update("🌐 在线翻译")
+
+    def safe_copy(text):
         if not text or not text.strip():
             return False
         if hasattr(sg, "clipboard_set"):
@@ -795,402 +804,646 @@ def run_gui():
                 pass
         return False
 
-    # ---- 布局 ----
     layout = [
-        [sg.Text("📥 启动时翻译划选内容，之后可手动输入回车翻译",
-                 font=("微软雅黑", 12), key="-STATUS-")],
+        [sg.Text("输入内容后回车翻译", font=("微软雅黑", 12), key="-STATUS-")],
         [sg.Multiline(key="-INPUT-", size=(60, 6), font=("微软雅黑", 11), focus=True)],
         [sg.Text("🌐 翻译结果", font=("微软雅黑", 12))],
         [sg.Multiline(key="-OUTPUT-", size=(60, 18), font=("微软雅黑", 11))],
         [
-            sg.Button("🔊 英音", key="-PLAY-GB-", size=(8, 1)),
-            sg.Button("🔊 美音", key="-PLAY-US-", size=(8, 1)),
             sg.Button("📋 复制", key="-COPY-", size=(10, 1)),
             sg.Button("🗑️ 清空", key="-CLEAR-", size=(10, 1)),
             sg.Button("🚪 退出", key="-EXIT-", size=(10, 1)),
         ],
     ]
-    window = sg.Window("划选即译 (Bing + PRIMARY)", layout,
-                       resizable=True, finalize=True,
-                       return_keyboard_events=True)
 
-    # ---- Qt 后端: 输出框原生右键菜单 (复制选中/全选) ----
+    window = sg.Window(
+        "dic",
+        layout,
+        resizable=True,
+        finalize=True,
+        return_keyboard_events=True,
+    )
+
     if using_qt:
         try:
             from PySide6.QtWidgets import QMenu
             from PySide6.QtGui import QAction
             from PySide6.QtCore import Qt as _Qt
-            _w = window["-OUTPUT-"].Widget
+            out_widget = window["-OUTPUT-"].Widget
 
             def _show_menu(pos):
-                menu = QMenu(_w)
+                menu = QMenu(out_widget)
                 a1 = QAction("📋 复制选中", menu)
-                a1.triggered.connect(lambda: safe_copy_to_clipboard(
-                    _w.textCursor().selectedText().replace("\u2029", "\n")))
+                a1.triggered.connect(
+                    lambda: safe_copy(
+                        out_widget.textCursor().selectedText().replace("\u2029", "\n")
+                    )
+                )
                 a2 = QAction("全选", menu)
-                a2.triggered.connect(_w.selectAll)
+                a2.triggered.connect(out_widget.selectAll)
                 menu.addAction(a1)
                 menu.addAction(a2)
-                menu.exec(_w.mapToGlobal(pos))
+                menu.exec(out_widget.mapToGlobal(pos))
 
-            _w.setContextMenuPolicy(_Qt.CustomContextMenu)
-            _w.customContextMenuRequested.connect(_show_menu)
-        except Exception as _e:
-            print("右键菜单挂载失败(不影响主功能):", _e)
+            out_widget.setContextMenuPolicy(_Qt.CustomContextMenu)
+            out_widget.customContextMenuRequested.connect(_show_menu)
+        except Exception as exc:
+            print("右键菜单挂载失败(不影响主功能):", exc)
 
-    # ---- 输出框选择/复制 (兼容 Tk 与 Qt 后端) ----
-    def _out_widget():
-        return window["-OUTPUT-"].Widget
+    if initial_text:
+        initial_text = initial_text.strip()
+        if initial_text:
+            window["-INPUT-"].update(initial_text)
+            do_translate(initial_text)
 
-    def _sel_text():
-        try:   # Tk 后端
-            return _out_widget().get("sel.first", "sel.last") or ""
-        except Exception:
-            pass
-        try:   # Qt 后端
-            tc = _out_widget().textCursor()
-            return tc.selectedText().replace("\u2029", "\n")
-        except Exception:
-            return ""
-
-    def _select_all():
-        try:   # Tk 后端
-            _out_widget().tag_add("sel", "1.0", "end")
-            return
-        except Exception:
-            pass
-        try:   # Qt 后端
-            _out_widget().selectAll()
-        except Exception:
-            pass
-
-    # ---- 启动时一次性读取 PRIMARY 并翻译（之后不再监听/轮询） ----
-    initial_primary, primary_source = get_primary_selection()
-    if primary_source:
-        window["-STATUS-"].update(f"📥 已读取划选内容（源：{primary_source}）")
-    elif _OS == "Windows":
-        window["-STATUS-"].update("⚠️ Windows 无 PRIMARY 槽，请手动输入翻译")
-    if initial_primary.strip():
-        window["-INPUT-"].update(initial_primary)
-        do_translate(initial_primary)
-
-    # Qt 端口键码（16777220=Return, 16777216=Escape）
     ENTER_KEYS = {"special 16777220", "special 16777221", "\r", "\n"}
-    ESC_KEYS = {"special 16777216", "Escape:27"}
+    ESC_KEYS = {"special 16777216", "Escape:27", "Escape"}
 
     try:
         while True:
-            event, values = window.read()   # 阻塞式，无轮询
-            # ---- 退出分支（幂等：多路径收敛到同一 break） ----
-            if (event in (sg.WIN_CLOSED, None, "")
-                    or event == "-EXIT-" or event in ESC_KEYS):
+            event, values = window.read()
+            if (
+                event in (sg.WIN_CLOSED, None, "")
+                or event == "-EXIT-"
+                or event in ESC_KEYS
+            ):
                 break
 
-            # ---- 手动输入：回车触发翻译 ----
             if event in ENTER_KEYS:
-                input_text = (values.get("-INPUT-", "") or "").strip()
-                if input_text:
-                    do_translate(input_text)
+                text = (values.get("-INPUT-", "") or "").strip()
+                if text:
+                    do_translate(text)
                 continue
 
-            # ---- 复制（幂等） ----
             if event == "-COPY-":
-                output_text = (values.get("-OUTPUT-", "") or "").strip()
-                if output_text and safe_copy_to_clipboard(output_text):
-                    sg.popup_quick("✅ 已复制到剪贴板", auto_close_duration=0.8,
-                                   background_color="green", text_color="white")
-                else:
-                    sg.popup_quick("⛔ 复制失败或无内容", auto_close_duration=0.8,
-                                   background_color="orange", text_color="white")
+                text = (values.get("-OUTPUT-", "") or "").strip()
+                safe_copy(text)
                 continue
 
-            # ---- 发音（幂等） ----
             if event in ("-PLAY-GB-", "-PLAY-US-"):
-                if _cur["word"]:
-                    path = get_playable(_cur["word"],
-                                        "gb" if event == "-PLAY-GB-" else "us")
-                    if path and _play(path):
-                        window["-STATUS-"].update("🔊 " + os.path.basename(path))
-                    else:
-                        window["-STATUS-"].update(
-                            "⛔ 无音频或缺少播放器(需 mpv/ffplay/vlc)")
-                else:
+                word = current.get("word")
+                if not word:
                     window["-STATUS-"].update("当前结果无本地发音")
+                    continue
+
+                variant = "gb" if event == "-PLAY-GB-" else "us"
+                path = get_playable(word, variant)
+                if path and _play_audio(path):
+                    window["-STATUS-"].update("🔊 " + os.path.basename(path))
+                else:
+                    window["-STATUS-"].update(
+                        "⛔ 无音频或缺少播放器(需 mpv/ffplay/vlc)"
+                    )
                 continue
 
             if event == "复制选中":
-                t = _sel_text()
-                if t and safe_copy_to_clipboard(t):
-                    sg.popup_quick("✅ 已复制选中内容", auto_close_duration=0.8,
-                                   background_color="green", text_color="white")
-                else:
-                    sg.popup_quick("请先用鼠标拖选要复制的内容",
-                                   auto_close_duration=0.8)
+                try:
+                    text = window["-OUTPUT-"].Widget.textCursor().selectedText()
+                    text = text.replace("\u2029", "\n")
+                except Exception:
+                    text = ""
+                safe_copy(text)
                 continue
 
             if event == "全选":
-                _select_all()
+                try:
+                    window["-OUTPUT-"].Widget.selectAll()
+                except Exception:
+                    pass
                 continue
 
             if event == "-CLEAR-":
                 window["-INPUT-"].update("")
                 window["-OUTPUT-"].update("")
+                current["word"] = None
                 continue
     finally:
         try:
             window.close()
         except Exception:
             pass
-    sys.exit(0)
 
 
 # ============================================================
-# CLI（原 dicli.py）
+# WebView 词典窗口
 # ============================================================
-# ============================================================
-# Webview GUI（pywebview, 直接渲染词典原始 HTML）
-# ============================================================
-WEB_SHELL = """<!DOCTYPE html>
-<html><head><meta charset="utf-8">
+
+WEB_SHELL = r'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
 <style>
-body { font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif; font-size: 15px;
-       margin: 0; line-height: 1.55; }
-#bar { position: sticky; top: 0; background: #f5f5f5; border-bottom: 1px solid #ddd;
-       padding: 8px; display: flex; gap: 6px; z-index: 9; }
-#q { flex: 1; font-size: 15px; padding: 6px 10px; border: 1px solid #ccc;
-     border-radius: 6px; }
-button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px;
-         background: #fff; cursor: pointer; }
+body {
+    font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif;
+    font-size: 15px;
+    margin: 0;
+    line-height: 1.55;
+}
+#bar {
+    position: sticky;
+    top: 0;
+    background: #f5f5f5;
+    border-bottom: 1px solid #ddd;
+    padding: 8px;
+    display: flex;
+    gap: 6px;
+    z-index: 99999;
+}
+#q {
+    flex: 1;
+    font-size: 15px;
+    padding: 6px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+}
+button {
+    padding: 6px 12px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+}
 button:hover { background: #eee; }
 #content { padding: 14px 18px; }
 #content img { max-width: 100%; }
-a[data-sound] { text-decoration: none; cursor: pointer; }
+[data-sound] { cursor: pointer; }
 </style>
 <style id="dict-css"></style>
 </head>
 <body>
 <div id="bar">
-  <input id="q" value="__WORD__" placeholder="输入单词后回车…" autofocus>
-  <button onclick="doLookup()">查词</button>
+  <input id="q" value="__WORD__" placeholder="输入单词后回车…" autocomplete="off" autofocus>
+  <button id="lookup-button">查词</button>
 </div>
 <div id="content">__CONTENT__</div>
 <script>
-function bindSounds(root) {
-  root.querySelectorAll('[data-sound]').forEach(function (el) {
-    el.onclick = function () {
-      pywebview.api.play(el.getAttribute('data-sound'));
-    };
-  });
-}
-function applyJs(js) {
-  if (!js) return;
-  try {
-    var s = document.createElement('script');
-    s.textContent = 'try{' + js + '}catch(e){console.error(e)}';
-    document.getElementById('content').appendChild(s);
-  } catch (e) {}
-}
-function applyCss(css) {
-  var st = document.getElementById('dict-css');
-  if (st) st.textContent = css || '';
-}
-function doLookup() {
-  var w = document.getElementById('q').value.trim();
-  if (!w) return;
-  pywebview.api.lookup(w).then(function (r) {
-    if (r && r.html !== undefined) {
-      document.getElementById('content').innerHTML = r.html;
-      applyCss(r.css);
-      bindSounds(document.getElementById('content'));
-      applyJs(r.js);
-    }
-  });
-}
-document.getElementById('q').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter') doLookup();
-});
-window.addEventListener('pywebviewready', function () {
-  bindSounds(document.getElementById('content'));
-});
-bindSounds(document);
-</script>
-<script>__DICTJS__</script>\n</body></html>"""
+      var MEDIA_EXT = /\.(mp3|wav|ogg|oga|aac|m4a|spx|opus|wma)(\?|#|$)/i;
+      var DENY_SCHEME = /^(https?|mailto|javascript|about|file|entry|bword|gdlookup|dic):/i;
+      function flash(msg) {
+        var t = document.getElementById('dic-toast');
+        if (!t) {
+          t = document.createElement('div');
+          t.id = 'dic-toast';
+          t.style.cssText = 'position:fixed;right:12px;top:52px;background:#333;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;z-index:999999;max-width:70%;word-break:break-all;display:none;white-space:pre-wrap;';
+          document.body.appendChild(t);
+        }
+        t.textContent = msg;
+        t.style.display = 'block';
+        clearTimeout(t._tm);
+        t._tm = setTimeout(function(){ t.style.display = 'none'; }, 3500);
+      }
+      function stripScheme(s) { return String(s).replace(/^[a-z][a-z0-9+.\-]*:\/\//i, ''); }
+      function soundRef(el) {
+        if (!el || el.nodeType !== 1) return '';
+        var attrs = ['data-sound', 'data-src-mp3', 'src-mp3'];
+        for (var i = 0; i < attrs.length; i++) {
+          var v = el.getAttribute(attrs[i]);
+          if (v) return stripScheme(v);
+        }
+        if ((el.tagName || '').toLowerCase() === 'a') {
+          var h = String(el.getAttribute('href') || '').trim();
+          if (!h) return '';
+          var low = h.toLowerCase();
+          if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) return stripScheme(h);
+        }
+        return '';
+      }
+      function callPlay(ref) {
+        function go() {
+          Promise.resolve(pywebview.api.play(ref)).then(function(r) {
+            if (r) flash(String(r));
+          }).catch(function(err) { flash('⛔ play: ' + err); });
+        }
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { go(); return; }
+        var tries = 0;
+        var t = setInterval(function() {
+          tries++;
+          if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { clearInterval(t); go(); }
+          else if (tries > 50) { clearInterval(t); flash('⛔ pywebview 未就绪'); }
+        }, 200);
+      }
+      function handler(e) {
+        if (e.__dicHandled) return;
+        e.__dicHandled = true;
+        var node = e.target;
+        if (!node || node.nodeType !== 1) return;
+        while (node && node !== document) {
+          if (node.nodeType === 1) {
+            var ref = soundRef(node);
+            if (ref) {
+              e.preventDefault(); e.stopPropagation();
+              if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+              flash('🔊 ' + ref);
+              callPlay(ref);
+              return;
+            }
+            if ((node.tagName || '').toLowerCase() === 'a') {
+              var h = String(node.getAttribute('href') || '').trim();
+              if (h && !/^(https?:|#|javascript:|mailto:|about:)/i.test(h)) {
+                e.preventDefault(); e.stopPropagation();
+                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                if (!DENY_SCHEME.test(h)) {
+                  var clean = stripScheme(h);
+                  flash('🔊(兜底) ' + clean);
+                  callPlay(clean);
+                } else {
+                  flash('⛔ 非音频链接: ' + h + '\n' +
+                        String(node.outerHTML || '').substring(0, 120));
+                }
+                return;
+              }
+              if (h) return; // 普通网页链接放行
+              // 无 href 的 <a>: 继续向上找
+            }
+          }
+          node = node.parentNode;
+        }
+      }
+      ['click', 'auxclick'].forEach(function(ev) {
+        window.addEventListener(ev, handler, true);
+        document.addEventListener(ev, handler, true);
+      });
+      ['mousedown', 'pointerdown'].forEach(function(ev) {
+        window.addEventListener(ev, function(e) {
+          var node = e.target;
+          while (node && node !== document) {
+            if (node.nodeType === 1 && soundRef(node)) { e.preventDefault(); return; }
+            node = node.parentNode;
+          }
+        }, true);
+      });
+      function normalizeSounds(root) {
+        if (!root || !root.querySelectorAll) return;
+        var list = root.querySelectorAll('a[href]');
+        for (var i = 0; i < list.length; i++) {
+          var el = list[i];
+          var h = String(el.getAttribute('href') || '').trim();
+          var low = h.toLowerCase();
+          if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) {
+            el.setAttribute('data-sound', stripScheme(h));
+            el.removeAttribute('href');
+            el.removeAttribute('target');
+            el.removeAttribute('onclick');
+          }
+        }
+        var es = root.querySelectorAll('[data-src-mp3],[src-mp3]');
+        for (var j = 0; j < es.length; j++) {
+          var e2 = es[j];
+          var ref = e2.getAttribute('data-src-mp3') || e2.getAttribute('src-mp3') || '';
+          if (ref && !e2.getAttribute('data-sound')) {
+            e2.setAttribute('data-sound', stripScheme(ref));
+          }
+        }
+      }
+      var observer = new MutationObserver(function() {
+        normalizeSounds(document.getElementById('content'));
+      });
+      observer.observe(document.documentElement, {childList: true, subtree: true});
+      function applyCss(css) {
+        var st = document.getElementById('dict-css');
+        if (st) st.textContent = css || '';
+      }
+      function doLookup() {
+        var word = document.getElementById('q').value.trim();
+        if (!word) return;
+        if (!(window.pywebview && window.pywebview.api)) { flash('⏳ pywebview 未就绪'); return; }
+        pywebview.api.lookup(word).then(function(r) {
+          if (!r || r.switch) return;
+          document.getElementById('content').innerHTML = r.html || '';
+          applyCss(r.css || '');
+          normalizeSounds(document.getElementById('content'));
+        }).catch(function(err) { flash('⛔ ' + err); });
+      }
+      document.getElementById('lookup-button').addEventListener('click', doLookup);
+      document.getElementById('q').addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); doLookup(); return; }
+        if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation();
+          try { pywebview.api.close(); } catch (err) {}
+        }
+      }, true);
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation();
+          try { pywebview.api.close(); } catch (err) {}
+        }
+      }, true);
+      window.addEventListener('pywebviewready', function() {
+        normalizeSounds(document.getElementById('content'));
+      });
+      normalizeSounds(document.getElementById('content'));
+    </script>
+</body>
+</html>'''
 
-OXFORD9_CSS = """
-/* ==== dic 修正层 v5: 词典自带 oalecd9.css 为主, 仅必要微调 ==== */
+OXFORD9_CSS = r'''
 pron-g-blk br { display: none !important; }
-a[data-sound] { text-decoration: none; cursor: pointer; }
-"""
+[data-sound] { cursor: pointer; text-decoration: none; }
+'''
 
 
-def run_gui_web():
-    """pywebview 版 GUI: 渲染词典原始 HTML + 内置/外置 CSS"""
+def run_gui_web(initial_text=None, auto_switch=True):
+    print("[dic] audio-build v6 pid=%d" % os.getpid(), file=sys.stderr)
     try:
         import webview
     except ImportError:
-        print("缺少 pywebview, 请先: pip install pywebview", file=sys.stderr)
-        run_gui()
+        print(
+            "缺少 pywebview，请先: pip install pywebview",
+            file=sys.stderr,
+        )
+        run_gui(initial_text=initial_text, auto_switch=auto_switch)
         return
 
     from html import escape as _esc
 
-    def _is_single_word(q):
-        q = q.strip()
-        if not q or len(q.split()) != 1:
-            return False
-        return not re.search(r"[.!?,;:?。！？，]", q)
+    state = {"mdx": None}
 
-    def _prepare(h):
-        h = h.replace("<xhtml:", "<").replace("</xhtml:", "</")
-        h = re.sub(r'href=["\']sound://([^"\']+)["\']',
-                   lambda m: 'href="javascript:void(0)" data-sound="%s"'
-                   % m.group(1), h)
-        h = re.sub(r'data-src-mp3=["\']([^"\']+)["\']',
-                   lambda m: 'data-sound="%s"' % m.group(1), h)
-        return h
+    def _prepare(html_text):
+        html_text = (
+            html_text
+            .replace("<xhtml:", "<")
+            .replace("</xhtml:", "</")
+        )
+        # 词典自带 JS 会重新接管发音链接, 一律剥离; 内联 on* 事件一并清除
+        html_text = re.sub(r"(?is)<script\b.*?</script\s*>", "", html_text)
+        html_text = re.sub(r"(?is)<script\b[^>]*/?>", "", html_text)
+        html_text = re.sub(
+            r"(?i)\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", html_text
+        )
+        try:
+            root = lh.fromstring(html_text)
+        except Exception:
+            root = None
+        if root is not None:
+            snd = re.compile(r"(?i)^sound://|\.mp3(\?|#|$)")
+            for el in list(root.iter()):
+                if not isinstance(el.tag, str):
+                    continue
+                tag = el.tag.split(":")[-1].lower()
+                ref = ""
+                for attr, val in list(el.attrib.items()):
+                    a = attr.lower()
+                    if a not in ("href", "src", "data-src-mp3",
+                                 "src-mp3", "data-sound"):
+                        continue
+                    v = (val or "").strip()
+                    if a == "data-sound":
+                        ref = ref or v
+                    elif snd.search(v) or a in ("data-src-mp3", "src-mp3"):
+                        if not ref:
+                            ref = re.sub(r"(?i)^sound://", "", v)
+                        el.attrib.pop(attr, None)
+                if ref:
+                    el.set("data-sound", ref)
+                    if tag == "a":
+                        for junk in ("href", "target", "onclick"):
+                            el.attrib.pop(junk, None)
+            html_text = lh.tostring(root, encoding="unicode")
+        # 兜底: 清掉一切残留的可导航 sound:// 引用(含未加引号写法)
+        html_text = re.sub(
+            r"(?i)\s+href\s*=\s*[\"']?sound://[^\s>\"']*", "", html_text
+        )
+        html_text = re.sub(
+            r"(?i)\s+src\s*=\s*[\"']?sound://[^\s>\"']*", "", html_text
+        )
+        return html_text
 
-    def _play(path):
-        for p in ("mpv", "ffplay", "cvlc"):
-            if shutil.which(p):
-                args = {
-                    "mpv":    [p, "--no-video", "--really-quiet", path],
-                    "ffplay": [p, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-                    "cvlc":   [p, "--play-and-exit", "--intf", "dummy", path],
-                }[p]
-                subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                return True
-        return False
-
-    state = {"mdx": None, "js": ""}
-
-    def _load_js(d):
-        import glob as _glob
-        parts = []
-        for jp in sorted(_glob.glob(os.path.join(d, "**", "*.js"),
-                                   recursive=True)):
-            try:
-                with open(jp, encoding="utf-8", errors="ignore") as f:
-                    parts.append(f.read())
-            except OSError:
-                pass
-        return "\n;\n".join(parts)
-
-    def _dump(html, css):
-        if os.environ.get("DIC_DUMP"):
-            try:
-                with open("/tmp/dic_last.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                with open("/tmp/dic_last.css", "w", encoding="utf-8") as f:
-                    f.write(css)
-            except OSError:
-                pass
+    def _dump(html_text, css):
+        if not os.environ.get("DIC_DUMP"):
+            return
+        try:
+            Path("/tmp/dic_last.html").write_text(html_text, encoding="utf-8")
+            Path("/tmp/dic_last.css").write_text(css, encoding="utf-8")
+        except OSError:
+            pass
 
     class Api:
         def lookup(self, word):
             word = (word or "").strip()
             if not word:
                 return {"html": "", "css": ""}
-            css = OXFORD9_CSS
-            if _is_single_word(word):
-                r = lookup(word)
-                if r["found"]:
-                    state["mdx"] = r.get("_mdx")
-                    css = r.get("css", "") + "\n" + OXFORD9_CSS
-                    if not state.get("js"):
-                        state["js"] = _load_js(os.path.dirname(state["mdx"]))
-                    html = _prepare(r["_html"])
-                    _dump(html, css)
-                    return {"html": html, "css": css,
-                            "js": state.get("js", "")}
+
+            # WebView 输入句子/短语 -> Qt。
+            if auto_switch and not _is_single_word(word):
+                _switch_ui(word, "native")
+                try:
+                    webview.windows[0].destroy()
+                except Exception:
+                    pass
+                return {"switch": True}
+
+            if not _is_single_word(word):
+                return {
+                    "html": "<p>%s</p>" % _esc(translate_text(word)),
+                    "css": "",
+                }
+
+            r = lookup(word)
+            if not r["found"]:
                 t = translate_text(word)
-                return {"html": "<p><b>%s</b>(本地未收录, 在线翻译)</p><p>%s</p>"
-                                % (_esc(word), _esc(t)), "css": ""}
-            return {"html": "<p>%s</p>" % _esc(translate_text(word)),
-                    "css": ""}
+                return {
+                    "html": (
+                        "<p><b>%s</b>（本地未收录，在线翻译）</p><p>%s</p>"
+                        % (_esc(word), _esc(t))
+                    ),
+                    "css": "",
+                }
+
+            state["mdx"] = r.get("_mdx")
+            state["word"] = r.get("word")
+            html_text = _prepare(r["_html"])
+            css = r.get("css", "") + "\n" + OXFORD9_CSS
+            _dump(html_text, css)
+
+            # 不加载词典自带 JS，避免其重新接管发音链接。
+            return {
+                "html": html_text,
+                "css": css,
+            }
 
         def play(self, ref):
+            import traceback as _tb
             mdx = state.get("mdx")
+            word = state.get("word") or ""
+            def L(*a):
+                try:
+                    with open("/tmp/dic_play.log", "a", encoding="utf-8") as f:
+                        f.write(time.strftime("[%H:%M:%S] ") +
+                                " ".join(str(x) for x in a) + "\n")
+                except OSError:
+                    pass
+            print("[dic.play]", ref, "| word:", word, file=sys.stderr)
+            L("play called:", repr(ref), "| word:", repr(word))
             if not mdx or not ref:
-                return
+                return "⛔ play: 内部状态缺失"
+            ref = str(ref).strip()
+            ref = re.sub(r"(?i)^[a-z][a-z0-9+.-]+://", "", ref)
+            audio_path = None
             try:
-                p = extract_audio(mdx, ref)
+                audio_path = extract_audio(mdx, ref)
             except Exception:
-                p = None
-            if p:
-                _play(p)
+                L("提取异常:", _tb.format_exc())
+            if not audio_path:
+                L("未命中 %r, 词条兜底: %r" % (ref, word))
+                for variant in ("gb", "us"):
+                    try:
+                        audio_path = get_playable(word, variant) if word else None
+                    except Exception:
+                        audio_path = None
+                    if audio_path:
+                        L("兜底命中:", variant)
+                        break
+            if not audio_path:
+                L("最终无音频:", ref)
+                return "⛔ 找不到音频: %s" % ref
+            played = _play_audio(audio_path)
+            L("播放:", audio_path, "成功" if played else "失败")
+            return ("🔊 " + os.path.basename(audio_path)) if played else "⛔ 播放失败"
 
-    def _entry_page(word="", body="", css="", js=""):
-        js = js.replace("</script", "<\\/script")
-        return (WEB_SHELL
-                .replace("__WORD__", _esc(word))
-                .replace("__CONTENT__", body)
-                .replace('<style id="dict-css"></style>',
-                         '<style id="dict-css">' + css + '</style>')
-                .replace("__DICTJS__", "try{\n" + js + "\n}catch(e){}"))
+        def close(self):
+            try:
+                webview.windows[0].destroy()
+            except Exception:
+                pass
+            return True
 
-    initial, source = get_primary_selection()
-    body, word0, css0, js0 = "", "", OXFORD9_CSS, ""
-    if initial.strip():
-        word0 = initial.strip()
-        if _is_single_word(word0):
-            r = lookup(word0)
-            if r["found"]:
-                state["mdx"] = r.get("_mdx")
-                css0 = r.get("css", "") + "\n" + OXFORD9_CSS
-                js0 = state.get("js") or _load_js(
-                    os.path.dirname(state["mdx"]))
-                state["js"] = js0
-                body = _prepare(r["_html"])
-                _dump(body, css0)
-            else:
-                body = "<p>%s</p>" % _esc(translate_text(initial))
+    def _entry_page(word="", body="", css=""):
+        return (
+            WEB_SHELL
+            .replace("__WORD__", _esc(word))
+            .replace("__CONTENT__", body)
+            .replace(
+                '<style id="dict-css"></style>',
+                '<style id="dict-css">' + css + '</style>',
+            )
+        )
+
+    initial = (initial_text or "").strip()
+    body = ""
+    word0 = ""
+    css0 = OXFORD9_CSS
+
+    if initial and _is_single_word(initial):
+        word0 = initial
+        r = lookup(initial)
+        if r["found"]:
+            state["mdx"] = r.get("_mdx")
+            state["word"] = r.get("word")
+            body = _prepare(r["_html"])
+            css0 = r.get("css", "") + "\n" + OXFORD9_CSS
+            _dump(body, css0)
         else:
             body = "<p>%s</p>" % _esc(translate_text(initial))
 
-    webview.create_window("dic", html=_entry_page(word0, body, css0, js0),
-                          js_api=Api(), width=760, height=860)
+    window = webview.create_window(
+        "dic",
+        html=_entry_page(word0, body, css0),
+        js_api=Api(),
+        width=760,
+        height=860,
+    )
+
+    # pywebview 有原生窗口的情况下，直接挂 Qt Esc 兜底；
+    # JS 同时也会处理 Esc，因此不同 backend 都能关闭。
+    try:
+        def _on_closed():
+            pass
+        window.events.closed += _on_closed
+    except Exception:
+        pass
+
     webview.start()
 
 
 def run_cli(content):
+    content = (content or "").strip()
+    if not content:
+        return 1
+
     r = lookup(content)
     if not r["found"]:
-        # 本地未收录 → Bing 在线翻译
         out = translate_text(content)
         print(out)
         return 0 if out else 1
+
     print(f"--- {r['dict']} | {r['word']}\n")
     print(r["text"])
+
     for variant in ("gb", "us"):
-        p = get_playable(r["word"], variant)
-        if p:
-            print(f" 🎧 {p}")
+        path = get_playable(r["word"], variant)
+        if path:
+            print(f" 🎧 {path}")
+
     return 0
 
 
 def main():
     args = sys.argv[1:]
+
     if not args:
-        run_gui()
-        return
-    if args[0] in ("-w", "--web"):
-        run_gui_web()
-        return
+        print('用法: ./dic [-g] "<content>"', file=sys.stderr)
+        return 1
+
+    if args[0] == "--native":
+        content = " ".join(args[1:]).strip()
+        if content:
+            run_gui(initial_text=content, auto_switch=True)
+        return 0
+
+    if args[0] == "--web":
+        content = " ".join(args[1:]).strip()
+        if content:
+            run_gui_web(initial_text=content, auto_switch=True)
+        return 0
+
+    if args[0] in ("-g", "--gui"):
+        content = " ".join(args[1:]).strip()
+        if not content:
+            print('用法: ./dic -g "<content>"', file=sys.stderr)
+            return 1
+
+        if _is_single_word(content):
+            run_gui_web(initial_text=content, auto_switch=True)
+        else:
+            run_gui(initial_text=content, auto_switch=True)
+        return 0
+
+    if args[0] in ("-w", "--webview"):
+        content = " ".join(args[1:]).strip()
+        if not content:
+            print('用法: ./dic -w "<word>"', file=sys.stderr)
+            return 1
+        run_gui_web(initial_text=content, auto_switch=False)
+        return 0
+
     if args[0] in ("-t", "--text"):
         content = " ".join(args[1:]).strip()
         if not content:
             print('用法: ./dic -t "<content>"', file=sys.stderr)
-            sys.exit(1)
-        sys.exit(run_cli(content))
+            return 1
+        return run_cli(content)
+
     if args[0] in ("-h", "--help"):
-        print("用法: ./dic            启动 GUI\n"
-              "      ./dic -t <text>  命令行查词/翻译")
-        return
-    # 兼容裸参数: ./dic word
-    sys.exit(run_cli(" ".join(args)))
+        print(
+            '用法:\n'
+            '  ./dic "<content>"       自动判断 GUI\n'
+            '  ./dic -g "<content>"   自动判断 GUI\n'
+            '  ./dic -w "<word>"      强制 WebView\n'
+            '  ./dic -t "<content>"   命令行模式'
+        )
+        return 0
+
+    content = " ".join(args).strip()
+    if not content:
+        return 1
+
+    if _is_single_word(content):
+        run_gui_web(initial_text=content, auto_switch=True)
+    else:
+        run_gui(initial_text=content, auto_switch=True)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())
