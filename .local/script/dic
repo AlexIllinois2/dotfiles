@@ -6,9 +6,11 @@ dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译）
 用法:
   ./dic                 启动 GUI（启动时读取一次划选内容并翻译，之后手动输入回车翻译）
   ./dic -t "<content>"  命令行查词/翻译
-
+  在系统自定义快捷键, 命令项输入: bash -lc '$HOME/.local/script/dic "$(/usr/bin/wl-paste -n -p)"'
+  
 依赖:
-  pip install requests lxml FreeSimpleGUIQt mdict_mquery
+  sudo dnf install lzo-devel gcc python3-devel
+  pip install requests lxml python-lzo mdict-mquery FreeSimpleGUIQt
   （FreeSimpleGUIQt 缺失时自动回退 Tk 版 FreeSimpleGUI）
 """
 import sys, os, re, glob, shutil, sqlite3, platform, subprocess
