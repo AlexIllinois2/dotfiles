@@ -595,32 +595,43 @@ def do_compress(src: Path, output_arg, level, volume_size=None, password=None):
 # ---------------- 解压 ----------------
 
 def extract_zip(archive, output_dir, stem, password=None, members=None):
-    # AES 加密 zip (bit 6): Python 标准库不支持, 直接回退 7z 工具
-    if password:
-        with zipfile.ZipFile(archive) as zf:
-            if any(i.flag_bits & 0x40 for i in zf.infolist()):
-                LOG.debug('检测到 AES 加密 zip, 回退到 7z 工具解压')
-                extract_external(archive, output_dir, stem, '7z', password, members)
-                return
-
-    def _pwd_bytes():
-        return password.encode('utf-8') if password else None
-
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
+
         if members:
             selected = _select_members((i.filename for i in infos), members)
             infos = [i for i in infos if _norm_arc_name(i.filename) in selected]
-            target = output_dir   # 部分解压: 直接放到输出目录, 保留包内路径
-        else:
-            target = _prepare_target(output_dir,
-                                     _top_roots(i.filename for i in infos), stem)
+
+        # 主动检测加密: bit0 = 通用加密标志; compress_type=99 = WinZip AES
+        encrypted = any(i.flag_bits & 0x1 or i.compress_type == 99 for i in infos)
+
+        if encrypted and not password:
+            LOG.debug('检测到加密 zip, 未提供密码, 交互输入')
+            password = prompt_password()
+            if password is None:
+                raise ArcError('未提供密码, 无法解压加密 zip (可用 -p/--密码 指定)')
+
+        if password and any(i.compress_type == 99 for i in infos):
+            # AES 加密: 标准库不支持, 回退 7z 工具 (无论密码来源)
+            LOG.debug('检测到 AES 加密 zip, 回退到 7z 工具解压')
+            extract_external(archive, output_dir, stem, '7z', password, members)
+            return
+
+        target = output_dir if members else \
+            _prepare_target(output_dir, _top_roots(i.filename for i in infos), stem)
         try:
             for n, info in enumerate(infos, 1):
-                LOG.debug('[%d/%d] 解出 %s (%s)', n, len(infos), info.filename,
-                          human_size(info.file_size))
-                zf.extract(info, target, pwd=_pwd_bytes())
+                LOG.debug('[%d/%d] 解出 %s (%s)', n, len(infos),
+                          info.filename, human_size(info.file_size))
+                zf.extract(info, target,
+                           pwd=password.encode('utf-8') if password else None)
         except RuntimeError as e:
+            # ZipCrypto 密码错误 → 给用户一次重新输入的机会
+            if 'password' in str(e).lower() and encrypted:
+                LOG.debug('密码校验失败, 请重试')
+                retry = prompt_password('上一次密码错误')
+                if retry:
+                    return extract_zip(archive, output_dir, stem, retry, members)
             raise ArcError('解压失败 (密码错误或未提供 -p/--密码): %s' % e)
         except NotImplementedError as e:
             raise ArcError('该 zip 使用不支持的加密方式: %s (可尝试安装 7z 后重试)' % e)
@@ -639,6 +650,22 @@ def _check_tar_members(members, target):
                 raise ArcError('检测到不安全链接: %s -> %s' % (m.name, m.linkname))
         if m.isdev():
             raise ArcError('拒绝解压设备文件: %s' % m.name)
+            
+
+def prompt_password(hint=''):
+    """交互式询问密码, 最多 3 次, 空密码/中断返回 None"""
+    for _ in range(3):
+        tip = '请输入压缩包密码' + ('(%s)' % hint if hint else '') + ': '
+        try:
+            pwd = getpass.getpass(tip)
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            return None
+        if pwd:
+            return pwd
+        print('密码不能为空', file=sys.stderr)
+    return None
+
 
 
 def extract_tar(archive, output_dir, stem, members=None):
