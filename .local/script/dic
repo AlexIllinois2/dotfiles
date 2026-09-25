@@ -937,7 +937,7 @@ WEB_SHELL = r'''<!DOCTYPE html>
 <style>
 body {
     font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif;
-    font-size: 15px;
+    font-size: 17px;
     margin: 0;
     line-height: 1.55;
 }
@@ -1025,7 +1025,7 @@ button:hover { background: #eee; }
         }, 200);
       }
       function handler(e) {
-        if (e.__dicHandled) return;
+        if (e.__dicHandled) return;var _sel=window.getSelection&&window.getSelection();if(_sel&&_sel.type==='Range'&&String(_sel).length){return;}
         e.__dicHandled = true;
         var node = e.target;
         if (!node || node.nodeType !== 1) return;
@@ -1069,7 +1069,7 @@ button:hover { background: #eee; }
         window.addEventListener(ev, function(e) {
           var node = e.target;
           while (node && node !== document) {
-            if (node.nodeType === 1 && soundRef(node)) { e.preventDefault(); return; }
+            if (node.nodeType === 1 && soundRef(node) && node === e.target) { e.preventDefault(); return; }
             node = node.parentNode;
           }
         }, true);
@@ -1097,8 +1097,61 @@ button:hover { background: #eee; }
           }
         }
       }
-      var observer = new MutationObserver(function() {
-        normalizeSounds(document.getElementById('content'));
+      function fixSound(root) { /* dic sound v10 */
+  if (!root || !root.querySelectorAll) return;
+  var els = root.querySelectorAll('[data-sound]');
+  for (var i = 0; i < els.length; i++) {
+    var a = els[i];
+    if (a.__dicDone) continue;
+    a.__dicDone = true;
+    var ref = a.getAttribute('data-sound') || '';
+    if (!ref) continue;
+    if (!String(a.textContent).trim() && !a.querySelector('img')) {
+      // 罕见空锚点兜底: 绑到词典 CSS 画的图标元素(audio[name=xxx])上
+      var base = ref.replace(/\.mp3$/i, ''), au = null;
+      try { au = root.querySelector('audio[name="' + base + '"]'); } catch (err) {}
+      if (au && au !== a) {
+        au.setAttribute('data-sound', ref);
+        au.__dicDone = true;
+        au.style.cursor = 'pointer';
+        if (!au.style.display) au.style.display = 'inline-block';
+        continue;
+      }
+      var sib = a.nextElementSibling;
+      if (sib && !sib.getAttribute('data-sound') && String(sib.textContent).trim()) {
+        sib.setAttribute('data-sound', ref);
+        sib.__dicDone = true;
+      }
+      continue;
+    }
+    // 整行提升: pron 容器优先, 否则短音标行提升父容器
+    var done = false, p = a.parentElement;
+    for (var up = 0; p && p !== root && up < 2; up++, p = p.parentElement) {
+      var tn = String(p.tagName || '') + ' ' + String(p.getAttribute('class') || '');
+      if (tn.toLowerCase().indexOf('pron') >= 0) {
+        var kids = p.querySelectorAll('[data-sound]');
+        var all = kids.length > 0;
+        for (var k2 = 0; k2 < kids.length; k2++) {
+          if (String(kids[k2].getAttribute('data-sound')) !== ref) { all = false; break; }
+        }
+        if (all && !p.getAttribute('data-sound')) { p.setAttribute('data-sound', ref); done = true; }
+        break;
+      }
+    }
+    if (!done) {
+      var par = a.parentElement;
+      if (par && par !== root && !par.getAttribute('data-sound')) {
+        var ks = par.querySelectorAll('[data-sound]');
+        if (ks.length === 1 && String(par.textContent).replace(/\s+/g, '').length <= 40) {
+          par.setAttribute('data-sound', ref);
+        }
+      }
+    }
+  }
+}
+function normalizeBoth(root) { normalizeSounds(root); try { fixSound(root); } catch (err) {} }
+var observer = new MutationObserver(function() {
+        normalizeBoth(document.getElementById('content'));
       });
       observer.observe(document.documentElement, {childList: true, subtree: true});
       function applyCss(css) {
@@ -1113,7 +1166,7 @@ button:hover { background: #eee; }
           if (!r || r.switch) return;
           document.getElementById('content').innerHTML = r.html || '';
           applyCss(r.css || '');
-          normalizeSounds(document.getElementById('content'));
+          normalizeBoth(document.getElementById('content'));
         }).catch(function(err) { flash('⛔ ' + err); });
       }
       document.getElementById('lookup-button').addEventListener('click', doLookup);
@@ -1131,21 +1184,197 @@ button:hover { background: #eee; }
         }
       }, true);
       window.addEventListener('pywebviewready', function() {
-        normalizeSounds(document.getElementById('content'));
+        normalizeBoth(document.getElementById('content'));
       });
-      normalizeSounds(document.getElementById('content'));
+      normalizeBoth(document.getElementById('content'));
     </script>
+
+<script>
+/* dic zoom patch (native webkit zoom) */
+var DIC_ZOOM = __ZOOM__;
+function dicApplyZoom() {
+  var tries = 0;
+  (function go() {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.set_zoom) {
+      pywebview.api.set_zoom(DIC_ZOOM);
+      return;
+    }
+    if (++tries < 50) { setTimeout(go, 200); }
+  })();
+}
+document.addEventListener('keydown', function(e) {
+  if (!(e.ctrlKey && !e.altKey && !e.metaKey)) return;
+  var k = e.key;
+  if (k === '=' || k === '+') { DIC_ZOOM = Math.min(3, +(DIC_ZOOM + 0.1).toFixed(2)); }
+  else if (k === '-')         { DIC_ZOOM = Math.max(0.5, +(DIC_ZOOM - 0.1).toFixed(2)); }
+  else if (k === '0')         { DIC_ZOOM = 1.0; }
+  else { return; }
+  e.preventDefault(); e.stopPropagation();
+  dicApplyZoom();
+  if (typeof flash === 'function') { flash('🔍 缩放 ' + Math.round(DIC_ZOOM * 100) + '%'); }
+}, true);
+</script>
+
+<script>
+/* dic copy patch */
+document.addEventListener('keydown', function(e) {
+    var _ae = document.activeElement;
+    if (_ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA')) return;
+    if (!(e.ctrlKey && !e.altKey && !e.metaKey)) return;
+    var k = (e.key || '').toLowerCase();
+    if (k === 'c' || k === 'insert') {
+        var sel = window.getSelection();
+        if (sel && String(sel).length) {
+            try { document.execCommand('copy'); flash('📋 已复制 ' + String(sel).length + ' 字符'); } catch (err) {}
+            e.preventDefault(); e.stopPropagation();
+        }
+    } else if (k === 'a') {
+        var r = document.createRange();
+        r.selectNodeContents(document.getElementById('content'));
+        var s = window.getSelection();
+        s.removeAllRanges(); s.addRange(r);
+        e.preventDefault(); e.stopPropagation();
+        flash('已全选, Ctrl+C 复制');
+    }
+}, true);
+</script>
 </body>
 </html>'''
 
 OXFORD9_CSS = r'''
 pron-g-blk br { display: none !important; }
 [data-sound] { cursor: pointer; text-decoration: none; }
+#content { font-size: 17px !important; line-height: 1.65 !important; }
+/* dic select patch */
+html, body, #content, #content * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+[data-sound], [data-sound] * { cursor: pointer; }
 '''
 
 
+# ============================================================
+# dic 配置持久化(窗口尺寸/缩放) + GTK 原生钩子 (dic cfg patch)
+# ============================================================
+def _dic_cfg_path():
+    d = os.path.join(os.path.expanduser("~"), ".config", "dic")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(d, "config.json")
+
+
+def _load_cfg():
+    try:
+        import json
+        with open(_dic_cfg_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cfg_merged(extra):
+    import json
+    cfg = _load_cfg()
+    cfg.update({k: v for k, v in extra.items() if v is not None})
+    try:
+        with open(_dic_cfg_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def _find_webkit(widget):
+    """GTK3 下递归查找 WebKit2.WebView"""
+    if hasattr(widget, "set_zoom_level") and hasattr(widget, "get_zoom_level"):
+        return widget
+    try:
+        children = widget.get_children()
+    except Exception:
+        return None
+    for ch in children:
+        r = _find_webkit(ch)
+        if r is not None:
+            return r
+    return None
+
+
+def _native_hook(_win, state):
+    """GUI 循环启动后: 定位原生 GTK 窗口, 恢复缩放/最大化,
+    挂 configure-event 防抖保存窗口尺寸(回调均在主线程)。"""
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, GLib
+    except Exception:
+        return
+
+    tries = {"n": 0}
+
+    def probe():
+        tries["n"] += 1
+        gtkw = None
+        for tw in Gtk.Window.list_toplevels():
+            if (tw.get_title() or "") == "dic":
+                gtkw = tw
+                break
+        if gtkw is None:
+            return tries["n"] < 100
+        wk = _find_webkit(gtkw)
+        if wk is None and tries["n"] < 40:
+            return True  # webview 子控件尚未挂好, 稍后再试
+        state["webkit"] = wk
+        cfg = _load_cfg()
+        try:
+            zoom0 = min(3.0, max(0.5, float(cfg.get("zoom") or 1.0)))
+        except Exception:
+            zoom0 = 1.0
+        try:
+            if wk is not None and abs(zoom0 - 1.0) > 1e-9:
+                wk.set_zoom_level(zoom0)
+            if cfg.get("maximized"):
+                gtkw.maximize()
+        except Exception:
+            pass
+
+        pend = {"id": None}
+
+        def _do_save():
+            pend["id"] = None
+            try:
+                if gtkw.is_maximized():
+                    _save_cfg_merged({"maximized": True})
+                else:
+                    cw, ch = gtkw.get_size()
+                    _save_cfg_merged({"maximized": False,
+                                      "width": int(cw), "height": int(ch)})
+            except Exception:
+                pass
+            return False
+
+        def _on_cfg(widget, event):
+            if pend["id"]:
+                try:
+                    GLib.source_remove(pend["id"])
+                except Exception:
+                    pass
+            pend["id"] = GLib.timeout_add(400, _do_save)
+            return False
+
+        try:
+            gtkw.connect("configure-event", _on_cfg)
+        except Exception:
+            pass
+        return False
+
+    GLib.timeout_add(300, probe)
+
+
 def run_gui_web(initial_text=None, auto_switch=True):
-    print("[dic] audio-build v6 pid=%d" % os.getpid(), file=sys.stderr)
+    print("[dic] audio-click v10 pid=%d" % os.getpid(), file=sys.stderr)
     try:
         import webview
     except ImportError:
@@ -1170,8 +1399,13 @@ def run_gui_web(initial_text=None, auto_switch=True):
         html_text = re.sub(r"(?is)<script\b.*?</script\s*>", "", html_text)
         html_text = re.sub(r"(?is)<script\b[^>]*/?>", "", html_text)
         html_text = re.sub(
-            r"(?i)\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", html_text
+            r"(?i)\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)",
+            "",
+            html_text
         )
+        # dic select patch: 清理禁选属性/内联样式, 允许选中复制
+        html_text = re.sub(r'''(?i)\s+unselectable\s*=\s*['"]?(on|true)['"]?''', "", html_text)
+        html_text = re.sub(r'''(?i)(style\s*=\s*['"][^'"]*?)user-select\s*:\s*none\s*;?''', r"\1", html_text)
         try:
             root = lh.fromstring(html_text)
         except Exception:
@@ -1185,8 +1419,7 @@ def run_gui_web(initial_text=None, auto_switch=True):
                 ref = ""
                 for attr, val in list(el.attrib.items()):
                     a = attr.lower()
-                    if a not in ("href", "src", "data-src-mp3",
-                                 "src-mp3", "data-sound"):
+                    if a not in ("href", "src", "data-src-mp3", "src-mp3", "data-sound"):
                         continue
                     v = (val or "").strip()
                     if a == "data-sound":
@@ -1197,16 +1430,43 @@ def run_gui_web(initial_text=None, auto_switch=True):
                         el.attrib.pop(attr, None)
                 if ref:
                     el.set("data-sound", ref)
-                    if tag == "a":
-                        for junk in ("href", "target", "onclick"):
-                            el.attrib.pop(junk, None)
-            html_text = lh.tostring(root, encoding="unicode")
+                if tag == "a":
+                    for junk in ("href", "target", "onclick"):
+                        el.attrib.pop(junk, None)
+            # dic sound-propagate patch: 把发音引用提升到 pron 容器,
+        # 点击音标文字/整行也能发音 (GoldenDict 风格)
+        for _el in list(root.iter()):
+            _ref = _el.get("data-sound")
+            if not _ref:
+                continue
+            _p = _el.getparent()
+            if _p is None or _p.get("data-sound"):
+                continue
+            if "pron" not in (_p.get("class") or "").lower():
+                continue
+            _refs = {s.get("data-sound") for s in _p.iter() if s.get("data-sound")}
+            if len(_refs) == 1:
+                _p.set("data-sound", _ref)
+        # dic nested-a patch: HTML 不允许 <a> 嵌套, WebKit 解析时会截断
+        # 外层 data-sound 锚点(音标/图标失去可点性); 把内层 <a> 改名 span
+        for _a in list(root.iter('a')):
+            _p = _a.getparent()
+            while _p is not None:
+                if isinstance(_p.tag, str) and _p.tag.lower() == 'a':
+                    _a.tag = 'span'
+                    break
+                _p = _p.getparent()
+        html_text = lh.tostring(root, encoding="unicode")
         # 兜底: 清掉一切残留的可导航 sound:// 引用(含未加引号写法)
         html_text = re.sub(
-            r"(?i)\s+href\s*=\s*[\"']?sound://[^\s>\"']*", "", html_text
+            r"(?i)\s+href\s*=\s*[\"']?sound://[^\s>\"']*",
+            "",
+            html_text
         )
         html_text = re.sub(
-            r"(?i)\s+src\s*=\s*[\"']?sound://[^\s>\"']*", "", html_text
+            r"(?i)\s+src\s*=\s*[\"']?sound://[^\s>\"']*",
+            "",
+            html_text
         )
         return html_text
 
@@ -1309,11 +1569,31 @@ def run_gui_web(initial_text=None, auto_switch=True):
                 pass
             return True
 
-    def _entry_page(word="", body="", css=""):
+        def set_zoom(self, level):
+            """原生 WebKit 缩放 + 持久化 (dic zoom save patch)"""
+            try:
+                level = min(3.0, max(0.5, float(level)))
+            except Exception:
+                return False
+            wk = state.get("webkit")
+            if wk is not None:
+                try:
+                    from gi.repository import GLib
+                    GLib.idle_add(wk.set_zoom_level, float(level))
+                except Exception:
+                    try:
+                        wk.set_zoom_level(float(level))
+                    except Exception:
+                        pass
+            _save_cfg_merged({"zoom": level})
+            return True
+
+    def _entry_page(word="", body="", css="", zoom=1.0):
         return (
             WEB_SHELL
             .replace("__WORD__", _esc(word))
             .replace("__CONTENT__", body)
+            .replace("__ZOOM__", repr(float(zoom)))
             .replace(
                 '<style id="dict-css"></style>',
                 '<style id="dict-css">' + css + '</style>',
@@ -1337,12 +1617,27 @@ def run_gui_web(initial_text=None, auto_switch=True):
         else:
             body = "<p>%s</p>" % _esc(translate_text(initial))
 
+    # dic 恢复上次窗口尺寸/缩放 (dic cfg patch)
+    _cfgd = _load_cfg()
+    zoom0 = 1.0
+    try:
+        zoom0 = min(3.0, max(0.5, float(_cfgd.get("zoom") or 1.0)))
+    except Exception:
+        pass
+
+    def _cfg_int(key, dft, lo, hi):
+        try:
+            return max(lo, min(hi, int(float(_cfgd.get(key) or dft))))
+        except Exception:
+            return dft
+
+    w0, h0 = _cfg_int("width", 760, 320, 7680), _cfg_int("height", 860, 300, 4320)
     window = webview.create_window(
         "dic",
-        html=_entry_page(word0, body, css0),
+        html=_entry_page(word0, body, css0, zoom0),
         js_api=Api(),
-        width=760,
-        height=860,
+        width=w0,
+        height=h0,
     )
 
     # pywebview 有原生窗口的情况下，直接挂 Qt Esc 兜底；
@@ -1354,7 +1649,7 @@ def run_gui_web(initial_text=None, auto_switch=True):
     except Exception:
         pass
 
-    webview.start()
+    webview.start(_native_hook, args=(window, state))
 
 
 def run_cli(content):
