@@ -1,59 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译）
+dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译 + WebView 在线词典站）
 
 用法:
-  ./dic                 启动 GUI（启动时读取一次划选内容并翻译，之后手动输入回车翻译）
-  ./dic -t "<content>"  命令行查词/翻译
-    在系统自定义快捷键, 命令项输入: bash -lc '$HOME/.local/script/dic "$(/usr/bin/wl-paste -n -p)"'
-  
-  
-# ============================================================
-# 依赖安装说明 (Linux / deb + dnf)
-# ============================================================
+  ./dic "<content>"     自动: 单词→WebView 本地词典; 短语/句子→WebView 在线词典
+  ./dic -t "<content>"  命令行查词/翻译 (短语时弹 WebView 在线词典窗口)
+  ./dic -w "<content>"  强制 WebView (auto_switch=False)
+  ./dic --native "<content>"  强制原生 Qt 窗口
 
-# 1) 系统包
-# Fedora / RHEL 系:
-sudo dnf install python3-lxml python3-gobject gtk3 webkit2gtk4.1 \
-     python3-requests python3-tkinter \
-     google-noto-sans-cjk-ttc-fonts pulseaudio-utils
+快捷键: bash -lc '$HOME/.local/script/dic "$(/usr/bin/wl-paste -n -p)"'
 
-# Debian / Ubuntu 系:
-sudo apt install python3-lxml python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 \
-     python3-requests python3-tk \
-     fonts-noto-cjk pulseaudio-utils
+依赖安装见文末注释; 非单词输入会在同一 WebView 窗口内打开 ONLINE_SITES
+(GoldenDict 风格 %GDWORD% 模板), 页面顶部有站点切换工具条。
 
-#   注 1: 老发行版 (Fedora < 38 / Ubuntu 22.04 / Debian 11) 把 webkit2gtk4.1
-#         (gir1.2-webkit2-4.1) 换成 ...4.0
-#   注 2: CJK 字体不装的话中文全变豆腐块, 别误判成词典坏了
-
-# 2) pip 包 (仓库里没有或版本太旧的)
-pip3 install --user 'pywebview>=4' PySide6 FreeSimpleGUI FreeSimpleGUIQt mdict-mquery
-#   Fedora 38+ / Ubuntu 23.04+ 报 externally-managed-environment 的话加:
-#   --break-system-packages
-
-# 3) 音频播放器 (脚本按 mpv → ffplay → cvlc → paplay 顺序回退,
-#    至少装一个即可; 都装也行)
-sudo apt install mpv          # deb 系 (官方仓库)
-sudo dnf install mpv          # dnf 系: mpv/ffmpeg 在 RPM Fusion, 需先:
-#     sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
-#   不想动 RPM Fusion 的话, pulseaudio-utils (paplay) 已在第 1 步装好, 兜底够用
-
-# 4) 离线词典
-下载 https://github.com/yanyingwang/goldendict 提供的百度网盘的 dicts/Oxford9 移动为 $HOME/.local/share/golden-dict/Oxford
-
-# 5) 验证
-python3 - <<'EOF'
-import lxml.html, requests, webview, mdict_mquery, FreeSimpleGUI
-import PySide6, FreeSimpleGUIQt
-import gi; gi.require_version('Gtk', '3.0')
-print("✅ python 依赖 OK")
-EOF
-fc-list :lang=zh | head -3     # 有输出 = 中文字体在
-~/.local/script/dic -w test    # 开窗 + 中文显示 + 点喇叭有声 = 全部就绪
-
+# 依赖 (Linux / deb + dnf)
+# Fedora/RHEL: sudo dnf install python3-lxml python3-gobject gtk3 webkit2gtk4.1 \
+#   python3-requests python3-tkinter google-noto-sans-cjk-ttc-fonts pulseaudio-utils
+# Debian/Ubuntu: sudo apt install python3-lxml python3-gi gir1.2-gtk-3.0 \
+#   gir1.2-webkit2-4.1 python3-requests python3-tk fonts-noto-cjk pulseaudio-utils
+# 注: 老发行版把 webkit2gtk4.1 换成 4.0; CJK 字体不装中文会变豆腐块
+# pip: pip3 install --user 'pywebview>=4' PySide6 FreeSimpleGUI FreeSimpleGUIQt mdict-mquery
+#   (报 externally-managed-environment 加 --break-system-packages)
+# 音频: mpv / ffplay / cvlc / paplay 任一即可
+# 离线词典: goldendict 的百度网盘 dicts/Oxford9 移到 ~/.local/share/golden-dict/Oxford
 """
+
 import sys, os, re, glob, shutil, sqlite3, platform, subprocess
 import time
 import requests
@@ -64,7 +36,7 @@ from pathlib import Path
 # ============================================================
 from lxml import html as lh
 
-NL, IND = '\x00', '\x02'   # 有意换行/缩进哨兵, 空白清洗后再还原
+NL, IND = '\x00', '\x02'  # 有意换行/缩进哨兵, 空白清洗后再还原
 
 NOISE = {
     'script', 'style', 'link', 'head', 'symbol', 'xsymb', 'img', 'hkey',
@@ -72,14 +44,21 @@ NOISE = {
     'audio-wr', 'audio', 'audio-gbs-liju', 'audio-uss-liju',
     'audio-brs-liju', 'audio-ams-liju', 'un',
 }
+
 # 在 NOISE 基础上追加要丢弃的交叉引用/同义词噪音
 RENDER_NOISE_EXTRA = {'xr-g', 'xr-gs', 'cf-blk', 'cf', 'syn-g-blk', 'syn-g'}
-BOLD = {'h', 'idm', 'pv', 'shcut', 'cf'}
-RESET = {
-    'pos-g': True, 'pv-blk': False, 'pv-g-blk': False, 'idm-blk': False,
-    'idm-gs-blk': False, 'subentry-g': False, 'boxblock': False,
-}
 
+BOLD = {'h', 'idm', 'pv', 'shcut', 'cf'}
+
+RESET = {
+    'pos-g': True,
+    'pv-blk': False,
+    'pv-g-blk': False,
+    'idm-blk': False,
+    'idm-gs-blk': False,
+    'subentry-g': False,
+    'boxblock': False,
+}
 
 POS_CN = {
     'verb': '动词', 'noun': '名词', 'adjective': '形容词', 'adverb': '副词',
@@ -88,25 +67,31 @@ POS_CN = {
     'modal verb': '情态动词', 'auxiliary verb': '助动词',
     'v.': '动词', 'n.': '名词', 'adj.': '形容词', 'adv.': '副词',
     'excl.': '感叹词', 'prep.': '介词', 'conj.': '连词', 'pron.': '代词',
-    'det.': '限定词', 'num.': '数词', 'modal v.': '情态动词', 'aux. v.': '助动词',
+    'det.': '限定词', 'num.': '数词', 'modal v.': '情态动词',
+    'aux. v.': '助动词',
 }
+
 POS = {}
 
 INFL_CN = [
-    ('past participle', '过去分词'), ('past simple', '过去式'),
-    ('-ing form', '现在分词'), ('present simple - he', '三单'),
-    ('present simple', '原形'), ('plural', '复数'), ('third person', '三单'),
+    ('past participle', '过去分词'),
+    ('past simple', '过去式'),
+    ('-ing form', '现在分词'),
+    ('present simple - he', '三单'),
+    ('present simple', '原形'),
+    ('plural', '复数'),
+    ('third person', '三单'),
 ]
 
 RENDER_NOISE_EXTRA = {
     'xr-g', 'xr-gs', 'cf-blk', 'cf', 'syn-g-blk', 'syn-g', 'syn-gs',
-    'lb-g', 'lb', 'lmb',       # language bank 语料库
+    'lb-g', 'lb', 'lmb',  # language bank 语料库
     'symbol', 'un', 'unx-g',
 }
 
 # 正文行走时直接跳过的标签(内容已单独提取或纯噪音)
-_SKIP_TAGS = {'h', 'phon', 'pos', 'brelabel', 'namelabel',
-              'pron-g', 'vpform', 'infl', 'v-g'}
+_SKIP_TAGS = {'h', 'phon', 'pos', 'brelabel', 'namelabel', 'pron-g',
+              'vpform', 'infl', 'v-g'}
 
 
 def _norm(tag):
@@ -171,6 +156,7 @@ def render(html_text, width=76, bold=True):
                 el.drop_tree()
             except Exception:
                 pass
+
     for tag in ('audio-gb', 'audio-us', 'pron-g', 'audio'):
         for el in list(root.iter(tag)):
             try:
@@ -202,19 +188,19 @@ def render(html_text, width=76, bold=True):
     head = []
     if word:
         head.append('单词：%s' % word)
-        if prons:
-            head.append('音标：' + '　｜　'.join(
-                '%s %s' % (lab, ph) for lab, ph in prons))
+    if prons:
+        head.append('音标：' + ' ｜ '.join(
+            '%s %s' % (lab, ph) for lab, ph in prons))
     if infl_rows:
         head.append('词形变化：')
         for name, w, ph in infl_rows:
-            head.append('    %s：%s%s' % (name, w, (' ' + ph) if ph else ''))
+            head.append('  %s：%s%s' % (name, w, (' ' + ph) if ph else ''))
 
     # ---- 4. 正文行走 ----
     out_lines = []
     cur = {'ind': 4, 'chunks': [], 'chn': []}
     st = {'sn': 0, 'num': True, 'top': 0}
-    sections = set()   # 已打印过的栏目标题, 防重复
+    sections = set()  # 已打印过的栏目标题, 防重复
 
     def B(t):
         return '\033[1m' + t + '\033[0m' if bold else t
@@ -226,7 +212,7 @@ def render(html_text, width=76, bold=True):
         text = re.sub(r'\s+', ' ', ''.join(cur['chunks'])).strip()
         if cur['chn']:
             cn = '；'.join(cur['chn'])
-            text = cn + ('　' + text if text else '')
+            text = cn + (' ' + text if text else '')
         if text:
             out_lines.append(' ' * cur['ind'] + text)
         cur['chunks'], cur['chn'] = [], []
@@ -259,7 +245,6 @@ def render(html_text, width=76, bold=True):
             return
         if tag in RESET:
             st['sn'], st['num'] = 0, RESET[tag]
-
         if tag == 'pos-g':
             p = ''
             for c in el.iter():
@@ -271,9 +256,8 @@ def render(html_text, width=76, bold=True):
             if p:
                 key = POS.get(p, p)
                 out_lines.append('%s (%s)：' % (POS_CN.get(key, key), key))
-            st['sn'], st['num'], cur['ind'] = 0, True, 4
+                st['sn'], st['num'], cur['ind'] = 0, True, 4
             return
-
         if tag == 'sn-g':
             flush()
             cur['ind'] = 4
@@ -281,8 +265,7 @@ def render(html_text, width=76, bold=True):
                 st['sn'] += 1
                 add('%d. ' % st['sn'])
             # 注意: 不 return, 继续走子节点取释义/例句
-
-        elif tag == 'shcut':   # 主题小标题
+        elif tag == 'shcut':  # 主题小标题
             t = (el.text_content() or '').strip()
             if t:
                 flush()
@@ -290,11 +273,9 @@ def render(html_text, width=76, bold=True):
                 out_lines.append('  ◆ ' + B(t))
                 cur['ind'] = 4
             return
-
         elif tag == 'x-g-blk':
             flush()
             cur['ind'] = 6
-
         elif tag in ('pv-blk', 'pv-g-blk'):
             flush()
             blank()
@@ -303,7 +284,6 @@ def render(html_text, width=76, bold=True):
                 sections.add('pv')
             cur['ind'] = 6
             # 不 return, 继续走子节点
-
         elif tag in ('idm-blk', 'idm-gs-blk'):
             flush()
             blank()
@@ -312,17 +292,15 @@ def render(html_text, width=76, bold=True):
                 sections.add('idm')
             cur['ind'] = 6
             # 不 return
-
-        elif tag in ('pv', 'idm'):   # 短语/习语词条头
+        elif tag in ('pv', 'idm'):  # 短语/习语词条头
             t = (el.text_content() or '').strip()
             if t:
                 flush()
                 blank()
-                out_lines.append('    · ' + B(t))
+                out_lines.append('  · ' + B(t))
                 cur['ind'] = 6
-            return   # 头已用 text_content 提取, 跳过自身子树
-
-        elif tag == 'x-g':   # 例句: 英文在前, 全译括号在后
+            return  # 头已用 text_content 提取, 跳过自身子树
+        elif tag == 'x-g':  # 例句: 英文在前, 全译括号在后
             flush()
             xs, chns = [], []
             for sub in el.iter():
@@ -334,27 +312,23 @@ def render(html_text, width=76, bold=True):
             eng = ' '.join(x for x in xs if x) or (el.text_content() or '').strip()
             cn = '；'.join(c for c in chns if c)
             cur['ind'] = 6
-            add('· ' + eng + (('　（%s）' % cn) if cn else ''))
+            add('· ' + eng + ((' （%s）' % cn) if cn else ''))
             flush()
             return
-
-        elif tag == 'chn':   # 释义中文: 缓存, flush 时前置
+        elif tag == 'chn':  # 释义中文: 缓存, flush 时前置
             t = (el.text_content() or '').strip()
             if t:
                 cur['chn'].append(t)
             return
-
         elif tag == 'gram':
             t = (el.text_content() or '').strip()
             if t:
                 add('(%s) ' % t)
             return
-
         elif tag == 'gram-blk':
             for c in el:
                 walk(c)
             return
-
         elif tag == 'li':
             flush()
             cur['ind'] += 2
@@ -388,13 +362,12 @@ def render(html_text, width=76, bold=True):
         for w in words:
             if buf and len(buf) + 1 + len(w) > width:
                 out.append(buf)
-                buf = ind + '  ' + w
+                buf = ind + '    ' + w
             else:
                 buf = (buf + ' ' + w) if buf else (ind + w)
         if buf:
             out.append(buf)
     return '\n'.join(out)
-
 
 
 # ============================================================
@@ -423,7 +396,7 @@ class MultiMDD:
         b._mdd_file = mdd
         b._mdd_db = db
         if not os.path.isfile(db):
-            print(f" [构建] MDD 索引(一次性): {os.path.basename(db)}")
+            print(f"  [构建] MDD 索引(一次性): {os.path.basename(db)}")
             b._make_mdd_index(db)
         self._mounted = vol
 
@@ -479,8 +452,11 @@ def multi_mdd_lookup(builder, ref, candidates):
 # 词典门面（原 dictapi.py）
 # ============================================================
 import mdict_mquery
-if not hasattr(mdict_mquery, "version"):   # 包内 bug: NameError: version
+
+if not hasattr(mdict_mquery, "version"):
+    # 包内 bug: NameError: version
     mdict_mquery.version = getattr(mdict_mquery, "__version__", "unknown")
+
 from mdict_mquery import IndexBuilder
 
 DICT_DIR = os.path.expanduser(
@@ -509,8 +485,8 @@ def _get_builder(mdx):
 def _purge_generated(m):
     """按后缀白名单清理包生成的索引/缓存, 绝不动 .mdx/.mdd 源文件"""
     stem = os.path.splitext(m)[0]
-    whitelist = {"index", "db", "idx", "cache", "pickle", "pkl", "keys",
-                 "sqlite", "sqlite3", "mquery"}
+    whitelist = {"index", "db", "idx", "cache", "pickle", "pkl",
+                 "keys", "sqlite", "sqlite3", "mquery"}
     for base in (m, stem):
         for p in sorted(glob.glob(base + ".*")):
             if p in (m, stem + ".mdx", stem + ".mdd"):
@@ -550,7 +526,8 @@ def _strip_dup(html):
         p = el.getparent()
         if p is None:
             continue
-        twin = any(tag(s) == "unbox" and text(s) == text(el) for s in p if s is not el)
+        twin = any(tag(s) == "unbox" and text(s) == text(el)
+                   for s in p if s is not el)
         if twin:
             p.remove(el)
             removed += 1
@@ -606,7 +583,7 @@ def lookup(word, bold=True):
         builder = _get_builder(mdx)
         results = builder.mdx_lookup(word)
         if not results:
-            results = builder.mdx_lookup(word.lower())   # 大小写兜底
+            results = builder.mdx_lookup(word.lower())  # 大小写兜底
         if not results:
             continue
         html = _to_str(results[0])
@@ -615,11 +592,9 @@ def lookup(word, bold=True):
         import glob as _glob
         _css_parts = []
         for _cp in sorted(_glob.glob(os.path.join(
-                os.path.dirname(mdx), "**", "*.css"),
-                recursive=True)):
+                os.path.dirname(mdx), "**", "*.css"), recursive=True)):
             try:
-                with open(_cp, encoding="utf-8",
-                          errors="ignore") as _f:
+                with open(_cp, encoding="utf-8", errors="ignore") as _f:
                     _css_parts.append(_f.read())
             except OSError:
                 pass
@@ -634,8 +609,8 @@ def lookup(word, bold=True):
             _lines = r["text"].split("\n")
             _lines[0] = _lines[0].rstrip() + " 【" + _hw + "】"
             r["text"] = "\n".join(_lines)
-        r["audio_refs"] = _parse_audio_refs(html)   # 只记引用, 不解压
-        break   # 命中第一个词典即止
+        r["audio_refs"] = _parse_audio_refs(html)  # 只记引用, 不解压
+        break  # 命中第一个词典即止
     return r
 
 
@@ -651,7 +626,7 @@ def _parse_audio_refs(html):
             base = os.path.basename(ref)
             if base.startswith("_") or ("__" in base and any(
                     t in base for t in ("gbs", "uss", "brs", "ams"))):
-                continue   # 例句音包未下载, 跳过
+                continue  # 例句音包未下载, 跳过
             seen.add(ref)
             refs.append(ref)
     return refs
@@ -695,6 +670,7 @@ def extract_audio(mdx, ref):
         fp.write(data)
     return out
 
+
 def get_playable(word, variant="gb"):
     """查词并解压指定发音变体("gb"英音/"us"美音), 返回 mp3 路径或 None
     不走 render(), 纯查索引, 开销极小"""
@@ -730,7 +706,8 @@ def translate_text(text, target_lang="zh-Hans"):
         resp = requests.post(url, json=[text], headers=headers, timeout=15)
         resp.raise_for_status()
         result = resp.json()
-        if (isinstance(result, list) and result and "translations" in result[0]):
+        if (isinstance(result, list) and result
+                and "translations" in result[0]):
             return result[0]["translations"][0]["text"].strip()
         return "解析响应失败"
     except requests.exceptions.RequestException as e:
@@ -738,12 +715,320 @@ def translate_text(text, target_lang="zh-Hans"):
 
 
 # ============================================================
+# GoldenDict 风格在线词典/翻译站
+# 非单词输入时在同一 WebView 窗口内打开(像本地查词一样渲染);
+# 模板里的 %GDWORD% 会被替换成 URL 编码后的查询文本, 按需增删即可
+# ============================================================
+ONLINE_SITES = [
+    "http://dict.youdao.com/w/eng/%GDWORD%",
+    "https://www.bing.com/dict/search?q=%GDWORD%",
+]
+
+
+def online_site_urls(text):
+    """按模板生成完整 URL 列表 (%GDWORD% -> urlencode(text))"""
+    import urllib.parse
+    q = urllib.parse.quote((text or "").strip(), safe="")
+    return [t.replace("%GDWORD%", q) for t in ONLINE_SITES if "%GDWORD%" in t]
+
+
+def open_online_sites(text):
+    """(备用) 用系统默认浏览器依次打开 ONLINE_SITES, 返回成功个数"""
+    import webbrowser
+    n = 0
+    for url in online_site_urls(text):
+        try:
+            if webbrowser.open(url):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _idle_call(fn, *args):
+    """把 UI 调用投递到 GTK 主线程执行。
+    WebKitGTK 禁止跨线程操作 WebView; pywebview 的 JS-API 回调在
+    工作线程里, load_url/load_html 必须经过 GLib.idle_add。"""
+    done = {"v": False}
+
+    def _wrap():
+        done["v"] = True
+        try:
+            fn(*args)
+        except Exception:
+            pass
+        return False
+
+    try:
+        from gi.repository import GLib
+        GLib.idle_add(_wrap)
+    except Exception:
+        _wrap()
+
+    def _fallback():
+        if not done["v"]:  # 非 GTK 后端时 idle 不会跑, 线程内兜底
+            _wrap()
+        return False
+
+    try:
+        import threading
+        t = threading.Timer(1.2, _fallback)
+        t.daemon = True
+        t.start()
+    except Exception:
+        pass
+    return True
+
+
+def _online_navigate(window, url):
+    """线程安全地在本 WebView 窗口内打开 URL"""
+    def _go():
+        try:
+            window.load_url(url)
+        except Exception:
+            try:
+                import json as _j
+                window.evaluate_js("location.replace(%s)" % _j.dumps(url))
+            except Exception:
+                pass
+    return _idle_call(_go)
+
+
+def _online_site_names():
+    """ONLINE_SITES 的按钮短名, 未识别域名显示 host"""
+    import urllib.parse
+    names = []
+    for t in ONLINE_SITES:
+        host = urllib.parse.urlsplit(t).netloc.lower()
+        for k, v in (("youdao", "有道"), ("baidu", "百度翻译"),
+                     ("bing", "必应"), ("haici", "海词"),
+                     ("cambridge", "剑桥"), ("merriam", "韦氏"),
+                     ("collins", "柯林斯"), ("oxford", "牛津")):
+            if k in host:
+                names.append(v)
+                break
+        else:
+            names.append(host)
+    return names
+
+
+def _online_inject_js(query=""):
+    """远程词典页顶部注入站点切换工具条的 JS"""
+    import json
+    names = _online_site_names()
+    urls = online_site_urls(query or "")
+    data = [{"n": names[i], "u": urls[i]}
+            for i in range(min(len(names), len(urls)))]
+    return (
+        "(function(){var d=%s,q=%s;"
+        "var o=document.getElementById('dic-online-bar');"
+        "if(o)o.remove();"
+        "var b=document.createElement('div');b.id='dic-online-bar';"
+        "b.style.cssText='position:fixed;top:0;left:0;right:0;"
+        "z-index:2147483647;background:rgba(245,245,245,.97);"
+        "border-bottom:1px solid #ddd;padding:6px 8px;"
+        "display:flex;gap:6px;align-items:center;"
+        "font:14px/1.4 sans-serif;';"
+        "var t=document.createElement('span');t.textContent=q;"
+        "t.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis;"
+        "white-space:nowrap;color:#555;';b.appendChild(t);"
+        "function mk(s,fn){var x=document.createElement('button');"
+        "x.textContent=s;x.style.cssText='padding:4px 10px;"
+        "border:1px solid #ccc;border-radius:6px;background:#fff;"
+        "cursor:pointer;';x.onclick=function(){try{fn()}catch(e){}};"
+        "return x;}"
+        "d.forEach(function(it,i){b.appendChild(mk(it.n,function(){"
+        "pywebview.api.online_open(i);}));});"
+        "b.appendChild(mk('⌂',function(){pywebview.api.online_home();}));"
+        "b.appendChild(mk('✕',function(){pywebview.api.close();}));"
+        "document.body.appendChild(b);"
+        "document.body.style.paddingTop='44px';"
+        "document.addEventListener('keydown',function(e){"
+        "if(e.ctrlKey&&e.shiftKey&&(e.key==='I'||e.key==='i')){"
+        "e.preventDefault();try{pywebview.api.devtools();}catch(err){}return;}"
+        "if(e.key==='Escape'){"
+        "try{pywebview.api.close();}catch(err){}}},true);})();"
+    ) % (json.dumps(data, ensure_ascii=False),
+         json.dumps(query or "", ensure_ascii=False))
+
+
+def _online_stacked_html(query):
+    """GoldenDict 式拼接页: 所有在线站点以 iframe 上下排列。
+    (dic scroll patch) 跨域 iframe 滚到边不会接力滚动外层,
+    提供右侧悬浮 ▲▼⇈⇟ / Ctrl+↓↑ 等滚动外层的方式。"""
+    from html import escape as _e2
+    names = _online_site_names()
+    urls = online_site_urls(query or "")
+    rows = []
+    for i, u in enumerate(urls):
+        nm = names[i] if i < len(names) else u
+        rows.append(
+            '<div class="site"><div class="hd"><b>'
+            + str(i + 1) + ". " + _e2(nm) + "</b>"
+            + '<button onclick="var f=document.getElementById(\'f' + str(i)
+            + '\');if(f){var s=f.src;f.src=\'about:blank\';'
+              "setTimeout(function(){f.src=s;},60);}\">⟳</button>"
+            + '<button onclick="try{pywebview.api.open_external(' + str(i)
+            + ')}catch(e){}">↗ 独立打开</button>'
+            + '<span class="u">' + _e2(u) + "</span></div>"
+            + '<iframe id="f' + str(i) + '" src="' + _e2(u, quote=True)
+            + '" referrerpolicy="no-referrer"></iframe></div>'
+        )
+    return (
+        '<div id="stack-tip">🌐 已同时打开 ' + str(len(urls))
+        + " 个站点（上下拼接）。滚轮在站点内部滚动；跨站点用右侧 ▲▼ 按钮或 "
+          "Ctrl+↓/↑/PgDn/PgUp（焦点在站点里也有效），也可把鼠标移到站点间的"
+          "蓝色标题条上滚外页。站点空白=该站禁止内嵌，点其 ↗。</div>"
+        '<div id="stack-nav">'
+        '<button onclick="window.scrollTo(0,0)" title="回顶部">⇈</button>'
+        '<button onclick="window.scrollBy(0,-Math.round('
+        'window.innerHeight*0.9))" title="上一站/Ctrl+↑">▲</button>'
+        '<button onclick="window.scrollBy(0,Math.round('
+        'window.innerHeight*0.9))" title="下一站/Ctrl+↓">▼</button>'
+        '<button onclick="window.scrollTo(0,document.body.scrollHeight)"'
+        ' title="到底部">⇟</button>'
+        "</div>"
+        "<style>"
+        "#stack-tip{padding:8px 14px;color:#555;font-size:13px;"
+        "background:#f7f7f7;border-bottom:1px solid #eee;}"
+        "#stack-nav{position:fixed;right:10px;top:50%;"
+        "transform:translateY(-50%);display:flex;flex-direction:column;"
+        "gap:6px;z-index:2147483000;}"
+        "#stack-nav button{width:38px;height:38px;font-size:16px;"
+        "border:1px solid #c5cfdd;border-radius:8px;"
+        "background:rgba(255,255,255,.95);cursor:pointer;"
+        "box-shadow:0 1px 4px rgba(0,0,0,.18);}"
+        "#stack-nav button:active{background:#e8eef7;}"
+        ".site{margin:0 0 10px 0;}"
+        ".site .hd{display:flex;gap:8px;align-items:center;padding:8px 14px;"
+        "background:#eef3fa;border-top:1px solid #dbe5f0;"
+        "border-bottom:1px solid #dbe5f0;font-size:14px;}"
+        ".site .hd .u{color:#888;font-size:12px;overflow:hidden;"
+        "text-overflow:ellipsis;white-space:nowrap;flex:1;}"
+        ".site .hd button{padding:2px 8px;font-size:12px;cursor:pointer;}"
+        ".site iframe{width:100%;height:82vh;border:0;display:block;"
+        "background:#fff;}"
+        "</style>" + "".join(rows)
+    )
+
 # ============================================================
 # GUI / CLI
 # ============================================================
+# ============================================================
+# (dic img patch) dicres:// 协议: 本地词典图片/CSS 资源从 MDD 直读
+# ============================================================
+_RES_SKIP = re.compile(r"(?i)^(https?:|data:|file:|dicres:|about:|//)")
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)")
+
+
+def _css_localize(css_text):
+    """词典 CSS 里的 url(/x.png) → url(dicres://x.png)"""
+    def _repl(m):
+        u = (m.group(2) or "").strip()
+        if not u or _RES_SKIP.match(u):
+            return m.group(0)
+        return "url(dicres://%s)" % u.replace("\\", "/").lstrip("/")
+    return _CSS_URL.sub(_repl, css_text or "")
+
+
+def _dicres_find(ref):
+    """按精确候选 → 全卷 basename 兜底, 在所有 MDD 卷里找资源"""
+    import glob as _g
+    mdx_list = sorted(_g.glob(os.path.join(DICT_DIR, "**", "*.mdx"),
+                              recursive=True))
+    data = None
+    for mdx in mdx_list:
+        try:
+            data = multi_mdd_lookup(_get_builder(mdx), ref, _candidates)
+        except Exception:
+            data = None
+        if data:
+            return data
+    base = os.path.basename(ref.replace("\\", "/")).lower()
+    if not base:
+        return None
+    for mdx in mdx_list:
+        try:
+            keys = _get_builder(mdx).get_mdd_keys()
+        except Exception:
+            continue
+        hit = None
+        for k in keys:
+            if isinstance(k, (tuple, list)):
+                k = k[0] if k else b""
+            if isinstance(k, bytes):
+                k = k.decode("utf-8", "ignore")
+            if os.path.basename(str(k).replace("\\", "/")).lower() == base:
+                hit = str(k)
+                break
+        if hit:
+            try:
+                data = multi_mdd_lookup(_get_builder(mdx), hit, _candidates)
+            except Exception:
+                data = None
+            if data:
+                return data
+    return None
+
+
+def _dicres_serve(request, *args):
+    """dicres:// 协议回调: 从 MDD 资源包提取图片等资源"""
+    import mimetypes
+    import urllib.parse as _up
+    from gi.repository import Gio as _Gio, GLib as _GLib
+    data = None
+    raw = ""
+    try:
+        uri = request.get_uri() or ""
+        raw = re.sub(r"(?i)^dicres://", "", uri).lstrip("/")
+        for cand in (_up.unquote(raw), raw):
+            if not cand:
+                continue
+            data = _dicres_find(cand)
+            if data:
+                break
+    except Exception:
+        data = None
+    try:
+        if data:
+            mime = mimetypes.guess_type(raw)[0] or "application/octet-stream"
+            stream = _Gio.MemoryInputStream.new_from_bytes(
+                _GLib.Bytes.new(bytes(data)))
+            request.finish(stream, len(data), mime)
+        else:
+            stream = _Gio.MemoryInputStream.new_from_bytes(
+                _GLib.Bytes.new(b""))
+            request.finish(stream, 0, "text/plain")
+    except Exception:
+        pass
+
+
+def _register_dicres_scheme():
+    """在默认 WebContext 上注册 dicres:// (必须在 webview 创建前调用)"""
+    try:
+        import gi as _gi
+    except Exception:
+        return False
+    ctx = None
+    for _ver in ("4.1", "4.0"):
+        try:
+            _gi.require_version("WebKit2", _ver)
+            from gi.repository import WebKit2 as _WK2
+            ctx = _WK2.WebContext.get_default()
+            break
+        except Exception:
+            ctx = None
+    if ctx is None:
+        return False
+    try:
+        ctx.register_uri_scheme("dicres", _dicres_serve)
+        return True
+    except Exception:
+        return False
+
 
 def _is_single_word(text):
-    """单个单词才使用 WebView 词典；短语/句子使用原生 Qt。"""
+    """单个单词才使用 WebView 词典；短语/句子使用在线词典站。"""
     text = (text or "").strip()
     if not text or len(text.split()) != 1:
         return False
@@ -791,7 +1076,6 @@ def _play_audio(path):
 # ============================================================
 # 原生 Qt 翻译窗口
 # ============================================================
-
 def run_gui(initial_text=None, auto_switch=True):
     try:
         import FreeSimpleGUIQt as sg
@@ -806,17 +1090,16 @@ def run_gui(initial_text=None, auto_switch=True):
         text = (text or "").strip()
         if not text:
             return
-
-        if auto_switch and _is_single_word(text):
+        if auto_switch:
+            # dic online patch: 单词/短语一律交给 WebView 窗口
+            # (单词→本地词典, 短语/句子→在线词典)
             _switch_ui(text, "web")
             try:
                 window.close()
             except Exception:
                 pass
             return
-
         current["word"] = None
-
         if _is_single_word(text):
             r = lookup(text, bold=False)
             if r["found"]:
@@ -824,8 +1107,7 @@ def run_gui(initial_text=None, auto_switch=True):
                 window["-STATUS-"].update("📖 本地词典 | " + r["dict"])
                 current["word"] = r["word"]
                 return
-            window["-STATUS-"].update("本地未收录, 在线翻译中…")
-
+        window["-STATUS-"].update("本地未收录, 在线翻译中…")
         window["-OUTPUT-"].update(translate_text(text))
         window["-STATUS-"].update("🌐 在线翻译")
 
@@ -911,24 +1193,20 @@ def run_gui(initial_text=None, auto_switch=True):
                 or event in ESC_KEYS
             ):
                 break
-
             if event in ENTER_KEYS:
                 text = (values.get("-INPUT-", "") or "").strip()
                 if text:
                     do_translate(text)
                 continue
-
             if event == "-COPY-":
                 text = (values.get("-OUTPUT-", "") or "").strip()
                 safe_copy(text)
                 continue
-
             if event in ("-PLAY-GB-", "-PLAY-US-"):
                 word = current.get("word")
                 if not word:
                     window["-STATUS-"].update("当前结果无本地发音")
                     continue
-
                 variant = "gb" if event == "-PLAY-GB-" else "us"
                 path = get_playable(word, variant)
                 if path and _play_audio(path):
@@ -938,7 +1216,6 @@ def run_gui(initial_text=None, auto_switch=True):
                         "⛔ 无音频或缺少播放器(需 mpv/ffplay/vlc)"
                     )
                 continue
-
             if event == "复制选中":
                 try:
                     text = window["-OUTPUT-"].Widget.textCursor().selectedText()
@@ -947,18 +1224,11 @@ def run_gui(initial_text=None, auto_switch=True):
                     text = ""
                 safe_copy(text)
                 continue
-
             if event == "全选":
                 try:
                     window["-OUTPUT-"].Widget.selectAll()
                 except Exception:
                     pass
-                continue
-
-            if event == "-CLEAR-":
-                window["-INPUT-"].update("")
-                window["-OUTPUT-"].update("")
-                current["word"] = None
                 continue
     finally:
         try:
@@ -970,42 +1240,15 @@ def run_gui(initial_text=None, auto_switch=True):
 # ============================================================
 # WebView 词典窗口
 # ============================================================
-
 WEB_SHELL = r'''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-body {
-    font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif;
-    font-size: 17px;
-    margin: 0;
-    line-height: 1.55;
-}
-#bar {
-    position: sticky;
-    top: 0;
-    background: #f5f5f5;
-    border-bottom: 1px solid #ddd;
-    padding: 8px;
-    display: flex;
-    gap: 6px;
-    z-index: 99999;
-}
-#q {
-    flex: 1;
-    font-size: 15px;
-    padding: 6px 10px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-}
-button {
-    padding: 6px 12px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    background: #fff;
-    cursor: pointer;
-}
+body { font-family: 'Noto Sans CJK SC', '微软雅黑', sans-serif; font-size: 17px; margin: 0; line-height: 1.55; }
+#bar { position: sticky; top: 0; background: #f5f5f5; border-bottom: 1px solid #ddd; padding: 8px; display: flex; gap: 6px; z-index: 99999; }
+#q { flex: 1; font-size: 15px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; }
+button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
 button:hover { background: #eee; }
 #content { padding: 14px 18px; }
 #content img { max-width: 100%; }
@@ -1015,130 +1258,136 @@ button:hover { background: #eee; }
 </head>
 <body>
 <div id="bar">
-  <input id="q" value="__WORD__" placeholder="输入单词后回车…" autocomplete="off" autofocus>
-  <button id="lookup-button">查词</button>
+<input id="q" value="__WORD__" placeholder="输入单词后回车…" autocomplete="off" autofocus>
+<button id="lookup-button">查词</button>
 </div>
 <div id="content">__CONTENT__</div>
 <script>
-      var MEDIA_EXT = /\.(mp3|wav|ogg|oga|aac|m4a|spx|opus|wma)(\?|#|$)/i;
-      var DENY_SCHEME = /^(https?|mailto|javascript|about|file|entry|bword|gdlookup|dic):/i;
-      function flash(msg) {
-        var t = document.getElementById('dic-toast');
-        if (!t) {
-          t = document.createElement('div');
-          t.id = 'dic-toast';
-          t.style.cssText = 'position:fixed;right:12px;top:52px;background:#333;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;z-index:999999;max-width:70%;word-break:break-all;display:none;white-space:pre-wrap;';
-          document.body.appendChild(t);
-        }
-        t.textContent = msg;
-        t.style.display = 'block';
-        clearTimeout(t._tm);
-        t._tm = setTimeout(function(){ t.style.display = 'none'; }, 3500);
+var MEDIA_EXT = /\.(mp3|wav|ogg|oga|aac|m4a|spx|opus|wma)(\?|#|$)/i;
+var DENY_SCHEME = /^(https?|mailto|javascript|about|file|entry|bword|gdlookup|dic):/i;
+function flash(msg) {
+  var t = document.getElementById('dic-toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'dic-toast';
+    t.style.cssText = 'position:fixed;right:12px;top:52px;background:#333;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;z-index:999999;max-width:70%;word-break:break-all;display:none;white-space:pre-wrap;';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(function(){ t.style.display = 'none'; }, 3500);
+}
+function stripScheme(s) {
+  return String(s).replace(/^[a-z][a-z0-9+.\-]*:\/\//i, '');
+}
+function soundRef(el) {
+  if (!el || el.nodeType !== 1) return '';
+  var attrs = ['data-sound', 'data-src-mp3', 'src-mp3'];
+  for (var i = 0; i < attrs.length; i++) {
+    var v = el.getAttribute(attrs[i]);
+    if (v) return stripScheme(v);
+  }
+  if ((el.tagName || '').toLowerCase() === 'a') {
+    var h = String(el.getAttribute('href') || '').trim();
+    if (!h) return '';
+    var low = h.toLowerCase();
+    if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) return stripScheme(h);
+  }
+  return '';
+}
+function callPlay(ref) {
+  function go() {
+    Promise.resolve(pywebview.api.play(ref)).then(function(r) {
+      if (r) flash(String(r));
+    }).catch(function(err) { flash('⛔ play: ' + err); });
+  }
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { go(); return; }
+  var tries = 0;
+  var t = setInterval(function() {
+    tries++;
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { clearInterval(t); go(); }
+    else if (tries > 50) { clearInterval(t); flash('⛔ pywebview 未就绪'); }
+  }, 200);
+}
+function handler(e) {
+  if (e.__dicHandled) return;
+  var _sel = window.getSelection && window.getSelection();
+  if (_sel && _sel.type === 'Range' && String(_sel).length) { return; }
+  e.__dicHandled = true;
+  var node = e.target;
+  if (!node || node.nodeType !== 1) return;
+  while (node && node !== document) {
+    if (node.nodeType === 1) {
+      var ref = soundRef(node);
+      if (ref) {
+        e.preventDefault(); e.stopPropagation();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        flash('🔊 ' + ref);
+        callPlay(ref);
+        return;
       }
-      function stripScheme(s) { return String(s).replace(/^[a-z][a-z0-9+.\-]*:\/\//i, ''); }
-      function soundRef(el) {
-        if (!el || el.nodeType !== 1) return '';
-        var attrs = ['data-sound', 'data-src-mp3', 'src-mp3'];
-        for (var i = 0; i < attrs.length; i++) {
-          var v = el.getAttribute(attrs[i]);
-          if (v) return stripScheme(v);
-        }
-        if ((el.tagName || '').toLowerCase() === 'a') {
-          var h = String(el.getAttribute('href') || '').trim();
-          if (!h) return '';
-          var low = h.toLowerCase();
-          if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) return stripScheme(h);
-        }
-        return '';
-      }
-      function callPlay(ref) {
-        function go() {
-          Promise.resolve(pywebview.api.play(ref)).then(function(r) {
-            if (r) flash(String(r));
-          }).catch(function(err) { flash('⛔ play: ' + err); });
-        }
-        if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { go(); return; }
-        var tries = 0;
-        var t = setInterval(function() {
-          tries++;
-          if (window.pywebview && window.pywebview.api && window.pywebview.api.play) { clearInterval(t); go(); }
-          else if (tries > 50) { clearInterval(t); flash('⛔ pywebview 未就绪'); }
-        }, 200);
-      }
-      function handler(e) {
-        if (e.__dicHandled) return;var _sel=window.getSelection&&window.getSelection();if(_sel&&_sel.type==='Range'&&String(_sel).length){return;}
-        e.__dicHandled = true;
-        var node = e.target;
-        if (!node || node.nodeType !== 1) return;
-        while (node && node !== document) {
-          if (node.nodeType === 1) {
-            var ref = soundRef(node);
-            if (ref) {
-              e.preventDefault(); e.stopPropagation();
-              if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-              flash('🔊 ' + ref);
-              callPlay(ref);
-              return;
-            }
-            if ((node.tagName || '').toLowerCase() === 'a') {
-              var h = String(node.getAttribute('href') || '').trim();
-              if (h && !/^(https?:|#|javascript:|mailto:|about:)/i.test(h)) {
-                e.preventDefault(); e.stopPropagation();
-                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-                if (!DENY_SCHEME.test(h)) {
-                  var clean = stripScheme(h);
-                  flash('🔊(兜底) ' + clean);
-                  callPlay(clean);
-                } else {
-                  flash('⛔ 非音频链接: ' + h + '\n' +
-                        String(node.outerHTML || '').substring(0, 120));
-                }
-                return;
-              }
-              if (h) return; // 普通网页链接放行
-              // 无 href 的 <a>: 继续向上找
-            }
+      if ((node.tagName || '').toLowerCase() === 'a') {
+        var h = String(node.getAttribute('href') || '').trim();
+        if (h && !/^(https?:|#|javascript:|mailto:|about:)/i.test(h)) {
+          e.preventDefault(); e.stopPropagation();
+          if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+          if (!DENY_SCHEME.test(h)) {
+            var clean = stripScheme(h);
+            flash('🔊(兜底) ' + clean);
+            callPlay(clean);
+          } else {
+            flash('⛔ 非音频链接: ' + h + '\n' + String(node.outerHTML || '').substring(0, 120));
           }
-          node = node.parentNode;
+          return;
         }
+        if (h) return; // 普通网页链接放行
+        // 无 href 的 <a>: 继续向上找
       }
-      ['click', 'auxclick'].forEach(function(ev) {
-        window.addEventListener(ev, handler, true);
-        document.addEventListener(ev, handler, true);
-      });
-      ['mousedown', 'pointerdown'].forEach(function(ev) {
-        window.addEventListener(ev, function(e) {
-          var node = e.target;
-          while (node && node !== document) {
-            if (node.nodeType === 1 && soundRef(node) && node === e.target) { e.preventDefault(); return; }
-            node = node.parentNode;
-          }
-        }, true);
-      });
-      function normalizeSounds(root) {
-        if (!root || !root.querySelectorAll) return;
-        var list = root.querySelectorAll('a[href]');
-        for (var i = 0; i < list.length; i++) {
-          var el = list[i];
-          var h = String(el.getAttribute('href') || '').trim();
-          var low = h.toLowerCase();
-          if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) {
-            el.setAttribute('data-sound', stripScheme(h));
-            el.removeAttribute('href');
-            el.removeAttribute('target');
-            el.removeAttribute('onclick');
-          }
-        }
-        var es = root.querySelectorAll('[data-src-mp3],[src-mp3]');
-        for (var j = 0; j < es.length; j++) {
-          var e2 = es[j];
-          var ref = e2.getAttribute('data-src-mp3') || e2.getAttribute('src-mp3') || '';
-          if (ref && !e2.getAttribute('data-sound')) {
-            e2.setAttribute('data-sound', stripScheme(ref));
-          }
-        }
+    }
+    node = node.parentNode;
+  }
+}
+['click', 'auxclick'].forEach(function(ev) {
+  window.addEventListener(ev, handler, true);
+  document.addEventListener(ev, handler, true);
+});
+['mousedown', 'pointerdown'].forEach(function(ev) {
+  window.addEventListener(ev, function(e) {
+    var node = e.target;
+    while (node && node !== document) {
+      if (node.nodeType === 1 && soundRef(node) && node === e.target) {
+        e.preventDefault();
+        return;
       }
-      function fixSound(root) { /* dic sound v10 */
+      node = node.parentNode;
+    }
+  }, true);
+});
+function normalizeSounds(root) {
+  if (!root || !root.querySelectorAll) return;
+  var list = root.querySelectorAll('a[href]');
+  for (var i = 0; i < list.length; i++) {
+    var el = list[i];
+    var h = String(el.getAttribute('href') || '').trim();
+    var low = h.toLowerCase();
+    if (low.indexOf('sound://') === 0 || MEDIA_EXT.test(low)) {
+      el.setAttribute('data-sound', stripScheme(h));
+      el.removeAttribute('href');
+      el.removeAttribute('target');
+      el.removeAttribute('onclick');
+    }
+  }
+  var es = root.querySelectorAll('[data-src-mp3],[src-mp3]');
+  for (var j = 0; j < es.length; j++) {
+    var e2 = es[j];
+    var ref = e2.getAttribute('data-src-mp3') || e2.getAttribute('src-mp3') || '';
+    if (ref && !e2.getAttribute('data-sound')) {
+      e2.setAttribute('data-sound', stripScheme(ref));
+    }
+  }
+}
+function fixSound(root) { /* dic sound v10 */
   if (!root || !root.querySelectorAll) return;
   var els = root.querySelectorAll('[data-sound]');
   for (var i = 0; i < els.length; i++) {
@@ -1175,7 +1424,10 @@ button:hover { background: #eee; }
         for (var k2 = 0; k2 < kids.length; k2++) {
           if (String(kids[k2].getAttribute('data-sound')) !== ref) { all = false; break; }
         }
-        if (all && !p.getAttribute('data-sound')) { p.setAttribute('data-sound', ref); done = true; }
+        if (all && !p.getAttribute('data-sound')) {
+          p.setAttribute('data-sound', ref);
+          done = true;
+        }
         break;
       }
     }
@@ -1190,46 +1442,44 @@ button:hover { background: #eee; }
     }
   }
 }
-function normalizeBoth(root) { normalizeSounds(root); try { fixSound(root); } catch (err) {} }
+function normalizeBoth(root) {
+  normalizeSounds(root);
+  try { fixSound(root); } catch (err) {}
+}
 var observer = new MutationObserver(function() {
-        normalizeBoth(document.getElementById('content'));
-      });
-      observer.observe(document.documentElement, {childList: true, subtree: true});
-      function applyCss(css) {
-        var st = document.getElementById('dict-css');
-        if (st) st.textContent = css || '';
-      }
-      function doLookup() {
-        var word = document.getElementById('q').value.trim();
-        if (!word) return;
-        if (!(window.pywebview && window.pywebview.api)) { flash('⏳ pywebview 未就绪'); return; }
-        pywebview.api.lookup(word).then(function(r) {
-          if (!r || r.switch) return;
-          document.getElementById('content').innerHTML = r.html || '';
-          applyCss(r.css || '');
-          normalizeBoth(document.getElementById('content'));
-        }).catch(function(err) { flash('⛔ ' + err); });
-      }
-      document.getElementById('lookup-button').addEventListener('click', doLookup);
-      document.getElementById('q').addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') { e.preventDefault(); doLookup(); return; }
-        if (e.key === 'Escape') {
-          e.preventDefault(); e.stopPropagation();
-          try { pywebview.api.close(); } catch (err) {}
-        }
-      }, true);
-      document.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape') {
-          e.preventDefault(); e.stopPropagation();
-          try { pywebview.api.close(); } catch (err) {}
-        }
-      }, true);
-      window.addEventListener('pywebviewready', function() {
-        normalizeBoth(document.getElementById('content'));
-      });
-      normalizeBoth(document.getElementById('content'));
-    </script>
-
+  normalizeBoth(document.getElementById('content'));
+});
+observer.observe(document.documentElement, {childList: true, subtree: true});
+function applyCss(css) {
+  var st = document.getElementById('dict-css');
+  if (st) st.textContent = css || '';
+}
+function doLookup() {
+  var word = document.getElementById('q').value.trim();
+  if (!word) return;
+  if (!(window.pywebview && window.pywebview.api)) { flash('⏳ pywebview 未就绪'); return; }
+  pywebview.api.lookup(word).then(function(r) {
+    if (!r || r.switch) return;
+    if (r && r.online) { document.getElementById('content').innerHTML = r.html || ''; applyCss(r.css || ''); normalizeBoth(document.getElementById('content')); return; }
+    document.getElementById('content').innerHTML = r.html || '';
+    applyCss(r.css || '');
+    normalizeBoth(document.getElementById('content'));
+  }).catch(function(err) { flash('⛔ ' + err); });
+}
+document.getElementById('lookup-button').addEventListener('click', doLookup);
+document.getElementById('q').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); doLookup(); return; }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); try { pywebview.api.close(); } catch (err) {} }
+}, true);
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) { e.preventDefault(); e.stopPropagation(); try { pywebview.api.devtools(); } catch (err) {} return; }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); try { pywebview.api.close(); } catch (err) {} }
+}, true);
+window.addEventListener('pywebviewready', function() {
+  normalizeBoth(document.getElementById('content'));
+});
+normalizeBoth(document.getElementById('content'));
+</script>
 <script>
 /* dic zoom patch (native webkit zoom) */
 var DIC_ZOOM = __ZOOM__;
@@ -1247,51 +1497,65 @@ document.addEventListener('keydown', function(e) {
   if (!(e.ctrlKey && !e.altKey && !e.metaKey)) return;
   var k = e.key;
   if (k === '=' || k === '+') { DIC_ZOOM = Math.min(3, +(DIC_ZOOM + 0.1).toFixed(2)); }
-  else if (k === '-')         { DIC_ZOOM = Math.max(0.5, +(DIC_ZOOM - 0.1).toFixed(2)); }
-  else if (k === '0')         { DIC_ZOOM = 1.0; }
+  else if (k === '-') { DIC_ZOOM = Math.max(0.5, +(DIC_ZOOM - 0.1).toFixed(2)); }
+  else if (k === '0') { DIC_ZOOM = 1.0; }
   else { return; }
   e.preventDefault(); e.stopPropagation();
   dicApplyZoom();
   if (typeof flash === 'function') { flash('🔍 缩放 ' + Math.round(DIC_ZOOM * 100) + '%'); }
 }, true);
 </script>
-
 <script>
 /* dic copy patch */
 document.addEventListener('keydown', function(e) {
-    var _ae = document.activeElement;
-    if (_ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA')) return;
-    if (!(e.ctrlKey && !e.altKey && !e.metaKey)) return;
-    var k = (e.key || '').toLowerCase();
-    if (k === 'c' || k === 'insert') {
-        var sel = window.getSelection();
-        if (sel && String(sel).length) {
-            try { document.execCommand('copy'); flash('📋 已复制 ' + String(sel).length + ' 字符'); } catch (err) {}
-            e.preventDefault(); e.stopPropagation();
-        }
-    } else if (k === 'a') {
-        var r = document.createRange();
-        r.selectNodeContents(document.getElementById('content'));
-        var s = window.getSelection();
-        s.removeAllRanges(); s.addRange(r);
-        e.preventDefault(); e.stopPropagation();
-        flash('已全选, Ctrl+C 复制');
+  var _ae = document.activeElement;
+  if (_ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA')) return;
+  if (!(e.ctrlKey && !e.altKey && !e.metaKey)) return;
+  var k = (e.key || '').toLowerCase();
+  if (k === 'c' || k === 'insert') {
+    var sel = window.getSelection();
+    if (sel && String(sel).length) {
+      try { document.execCommand('copy'); flash('📋 已复制 ' + String(sel).length + ' 字符'); } catch (err) {}
+      e.preventDefault(); e.stopPropagation();
     }
+  } else if (k === 'a') {
+    var r = document.createRange();
+    r.selectNodeContents(document.getElementById('content'));
+    var s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    e.preventDefault(); e.stopPropagation();
+    flash('已全选, Ctrl+C 复制');
+  }
 }, true);
 </script>
 </body>
 </html>'''
 
 OXFORD9_CSS = r'''
-pron-g-blk br { display: none !important; }
-[data-sound] { cursor: pointer; text-decoration: none; }
-#content { font-size: 17px !important; line-height: 1.65 !important; }
+pron-g-blk br {
+    display: none !important;
+}
+
+[data-sound] {
+    cursor: pointer;
+    text-decoration: none;
+}
+
+#content {
+    font-size: 17px !important;
+    line-height: 1.65 !important;
+}
+
 /* dic select patch */
 html, body, #content, #content * {
-  -webkit-user-select: text !important;
-  user-select: text !important;
+    -webkit-user-select: text !important;
+    user-select: text !important;
 }
-[data-sound], [data-sound] * { cursor: pointer; }
+
+[data-sound], [data-sound] * {
+    cursor: pointer;
+}
 '''
 
 
@@ -1352,7 +1616,6 @@ def _native_hook(_win, state):
         from gi.repository import Gtk, GLib
     except Exception:
         return
-
     tries = {"n": 0}
 
     def probe():
@@ -1368,6 +1631,96 @@ def _native_hook(_win, state):
         if wk is None and tries["n"] < 40:
             return True  # webview 子控件尚未挂好, 稍后再试
         state["webkit"] = wk
+        try:
+            if wk is not None:  # (dic devtools patch) 允许运行时打开检查器
+                wk.get_settings().props.enable_developer_extras = True
+        except Exception:
+            pass
+
+        # (dic esc patch) 窗口级按键拦截: key 事件先到 GTK 顶层窗口,
+        # 因此即使焦点在 iframe 里, Esc / Ctrl+Shift+I 也有效
+        def _toggle_insp():
+            if wk is None:
+                return
+            try:
+                wk.get_settings().props.enable_developer_extras = True
+            except Exception:
+                pass
+            try:
+                insp = wk.get_inspector()
+                if state.get("devtools"):
+                    insp.close()
+                    state["devtools"] = False
+                else:
+                    insp.show()
+                    state["devtools"] = True
+            except Exception:
+                pass
+
+        def _on_key(_w, ev):
+            name = ""
+            try:
+                name = ev.keyval_name or ""
+            except Exception:
+                pass
+            if name == "Escape":
+                try:
+                    _win.destroy()
+                except Exception:
+                    try:
+                        import webview as _wv
+                        if _wv.windows:
+                            _wv.windows[0].destroy()
+                    except Exception:
+                        pass
+                return True
+            try:
+                st = int(ev.state)
+                if (st & 5) == 5 and name in ("I", "i"):  # Ctrl|Shift
+                    _toggle_insp()
+                    return True
+                # (dic scroll patch) 仅 Ctrl: 滚动外层拼接页
+                if (st & 4) and not (st & 1):
+                    if name in ("Down", "Page_Down"):
+                        try:
+                            _win.evaluate_js("window.scrollBy(0,Math.round("
+                                             "window.innerHeight*0.9));")
+                        except Exception:
+                            pass
+                        return True
+                    if name in ("Up", "Page_Up"):
+                        try:
+                            _win.evaluate_js("window.scrollBy(0,-Math.round("
+                                             "window.innerHeight*0.9));")
+                        except Exception:
+                            pass
+                        return True
+                    if name == "Home":
+                        try:
+                            _win.evaluate_js("window.scrollTo(0,0);")
+                        except Exception:
+                            pass
+                        return True
+                    if name == "End":
+                        try:
+                            _win.evaluate_js(
+                                "window.scrollTo(0,document.body.scrollHeight);")
+                        except Exception:
+                            pass
+                        return True
+            except Exception:
+                pass
+            return False
+
+        try:
+            gtkw.connect("key-press-event", _on_key)
+        except Exception:
+            pass
+        try:
+            if wk is not None:  # (dic img patch) 兜底再注册一次资源协议
+                wk.get_context().register_uri_scheme("dicres", _dicres_serve)
+        except Exception:
+            pass
         cfg = _load_cfg()
         try:
             zoom0 = min(3.0, max(0.5, float(cfg.get("zoom") or 1.0)))
@@ -1380,7 +1733,6 @@ def _native_hook(_win, state):
                 gtkw.maximize()
         except Exception:
             pass
-
         pend = {"id": None}
 
         def _do_save():
@@ -1390,8 +1742,7 @@ def _native_hook(_win, state):
                     _save_cfg_merged({"maximized": True})
                 else:
                     cw, ch = gtkw.get_size()
-                    _save_cfg_merged({"maximized": False,
-                                      "width": int(cw), "height": int(ch)})
+                    _save_cfg_merged({"maximized": False, "width": int(cw), "height": int(ch)})
             except Exception:
                 pass
             return False
@@ -1423,12 +1774,19 @@ def run_gui_web(initial_text=None, auto_switch=True):
             "缺少 pywebview，请先: pip install pywebview",
             file=sys.stderr,
         )
-        run_gui(initial_text=initial_text, auto_switch=auto_switch)
+        # 兜底进 Qt 时关掉自动切换, 避免 web↔qt 无限互启
+        run_gui(initial_text=initial_text, auto_switch=False)
         return
-
     from html import escape as _esc
+    state = {"mdx": None, "word": None, "online": False,
+             "last_query": "", "webkit": None}
 
-    state = {"mdx": None}
+    def _goto_online(text):
+        """(dic stack patch) GoldenDict 式: 所有在线站点上下拼接在同一页面"""
+        text = (text or "").strip()
+        state["last_query"] = text
+        state["online"] = False  # 本地拼接页, 不注入远程工具条
+        return {"online": True, "html": _online_stacked_html(text), "css": ""}
 
     def _prepare(html_text):
         html_text = (
@@ -1441,12 +1799,13 @@ def run_gui_web(initial_text=None, auto_switch=True):
         html_text = re.sub(r"(?is)<script\b[^>]*/?>", "", html_text)
         html_text = re.sub(
             r"(?i)\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)",
-            "",
-            html_text
+            "", html_text
         )
         # dic select patch: 清理禁选属性/内联样式, 允许选中复制
-        html_text = re.sub(r'''(?i)\s+unselectable\s*=\s*['"]?(on|true)['"]?''', "", html_text)
-        html_text = re.sub(r'''(?i)(style\s*=\s*['"][^'"]*?)user-select\s*:\s*none\s*;?''', r"\1", html_text)
+        html_text = re.sub(r'''(?i)\s+unselectable\s*=\s*['"]?(on|true)['"]?''',
+                           "", html_text)
+        html_text = re.sub(r'''(?i)(style\s*=\s*['"][^'"]*?)user-select\s*:\s*none\s*;?''',
+                           r"\1", html_text)
         try:
             root = lh.fromstring(html_text)
         except Exception:
@@ -1457,10 +1816,18 @@ def run_gui_web(initial_text=None, auto_switch=True):
                 if not isinstance(el.tag, str):
                     continue
                 tag = el.tag.split(":")[-1].lower()
+                if tag == "img":
+                    # (dic img patch) 词典图片 → dicres:// 从 MDD 直读
+                    v = (el.get("src") or "").strip()
+                    if v and not _RES_SKIP.match(v):
+                        el.set("src", "dicres://"
+                               + v.replace("\\", "/").lstrip("/"))
+                    el.attrib.pop("srcset", None)
                 ref = ""
                 for attr, val in list(el.attrib.items()):
                     a = attr.lower()
-                    if a not in ("href", "src", "data-src-mp3", "src-mp3", "data-sound"):
+                    if a not in ("href", "src", "data-src-mp3",
+                                 "src-mp3", "data-sound"):
                         continue
                     v = (val or "").strip()
                     if a == "data-sound":
@@ -1475,39 +1842,38 @@ def run_gui_web(initial_text=None, auto_switch=True):
                     for junk in ("href", "target", "onclick"):
                         el.attrib.pop(junk, None)
             # dic sound-propagate patch: 把发音引用提升到 pron 容器,
-        # 点击音标文字/整行也能发音 (GoldenDict 风格)
-        for _el in list(root.iter()):
-            _ref = _el.get("data-sound")
-            if not _ref:
-                continue
-            _p = _el.getparent()
-            if _p is None or _p.get("data-sound"):
-                continue
-            if "pron" not in (_p.get("class") or "").lower():
-                continue
-            _refs = {s.get("data-sound") for s in _p.iter() if s.get("data-sound")}
-            if len(_refs) == 1:
-                _p.set("data-sound", _ref)
-        # dic nested-a patch: HTML 不允许 <a> 嵌套, WebKit 解析时会截断
-        # 外层 data-sound 锚点(音标/图标失去可点性); 把内层 <a> 改名 span
-        for _a in list(root.iter('a')):
-            _p = _a.getparent()
-            while _p is not None:
-                if isinstance(_p.tag, str) and _p.tag.lower() == 'a':
-                    _a.tag = 'span'
-                    break
-                _p = _p.getparent()
-        html_text = lh.tostring(root, encoding="unicode")
+            # 点击音标文字/整行也能发音 (GoldenDict 风格)
+            for _el in list(root.iter()):
+                _ref = _el.get("data-sound")
+                if not _ref:
+                    continue
+                _p = _el.getparent()
+                if _p is None or _p.get("data-sound"):
+                    continue
+                if "pron" not in (_p.get("class") or "").lower():
+                    continue
+                _refs = {s.get("data-sound") for s in _p.iter()
+                         if s.get("data-sound")}
+                if len(_refs) == 1:
+                    _p.set("data-sound", _ref)
+            # dic nested-a patch: HTML 不允许 <a> 嵌套, WebKit 解析时会截断
+            # 外层 data-sound 锚点(音标/图标失去可点性); 把内层 <a> 改名 span
+            for _a in list(root.iter('a')):
+                _p = _a.getparent()
+                while _p is not None:
+                    if isinstance(_p.tag, str) and _p.tag.lower() == 'a':
+                        _a.tag = 'span'
+                        break
+                    _p = _p.getparent()
+            html_text = lh.tostring(root, encoding="unicode")
         # 兜底: 清掉一切残留的可导航 sound:// 引用(含未加引号写法)
         html_text = re.sub(
             r"(?i)\s+href\s*=\s*[\"']?sound://[^\s>\"']*",
-            "",
-            html_text
+            "", html_text
         )
         html_text = re.sub(
             r"(?i)\s+src\s*=\s*[\"']?sound://[^\s>\"']*",
-            "",
-            html_text
+            "", html_text
         )
         return html_text
 
@@ -1525,22 +1891,9 @@ def run_gui_web(initial_text=None, auto_switch=True):
             word = (word or "").strip()
             if not word:
                 return {"html": "", "css": ""}
-
-            # WebView 输入句子/短语 -> Qt。
-            if auto_switch and not _is_single_word(word):
-                _switch_ui(word, "native")
-                try:
-                    webview.windows[0].destroy()
-                except Exception:
-                    pass
-                return {"switch": True}
-
+            # dic online patch: 短语/句子 -> 本窗口打开在线词典(不再切 Qt)
             if not _is_single_word(word):
-                return {
-                    "html": "<p>%s</p>" % _esc(translate_text(word)),
-                    "css": "",
-                }
-
+                return _goto_online(word)
             r = lookup(word)
             if not r["found"]:
                 t = translate_text(word)
@@ -1551,13 +1904,11 @@ def run_gui_web(initial_text=None, auto_switch=True):
                     ),
                     "css": "",
                 }
-
             state["mdx"] = r.get("_mdx")
             state["word"] = r.get("word")
             html_text = _prepare(r["_html"])
-            css = r.get("css", "") + "\n" + OXFORD9_CSS
+            css = _css_localize(r.get("css", "")) + "\n" + OXFORD9_CSS
             _dump(html_text, css)
-
             # 不加载词典自带 JS，避免其重新接管发音链接。
             return {
                 "html": html_text,
@@ -1568,13 +1919,15 @@ def run_gui_web(initial_text=None, auto_switch=True):
             import traceback as _tb
             mdx = state.get("mdx")
             word = state.get("word") or ""
+
             def L(*a):
                 try:
                     with open("/tmp/dic_play.log", "a", encoding="utf-8") as f:
-                        f.write(time.strftime("[%H:%M:%S] ") +
-                                " ".join(str(x) for x in a) + "\n")
+                        f.write(time.strftime("[%H:%M:%S] ") + " ".join(
+                            str(x) for x in a) + "\n")
                 except OSError:
                     pass
+
             print("[dic.play]", ref, "| word:", word, file=sys.stderr)
             L("play called:", repr(ref), "| word:", repr(word))
             if not mdx or not ref:
@@ -1603,6 +1956,81 @@ def run_gui_web(initial_text=None, auto_switch=True):
             L("播放:", audio_path, "成功" if played else "失败")
             return ("🔊 " + os.path.basename(audio_path)) if played else "⛔ 播放失败"
 
+        def online_open(self, idx):
+            """dic online patch: 在线词典窗口内切换站点"""
+            try:
+                idx = int(idx)
+            except Exception:
+                idx = 0
+            urls = online_site_urls(state.get("last_query") or "")
+            if not urls:
+                return "⛔ 无查询内容"
+            if idx < 0 or idx >= len(urls):
+                idx = 0
+            state["online"] = True
+            try:
+                _online_navigate(window, urls[idx])
+                return "🌐 " + _online_site_names()[idx]
+            except Exception as exc:
+                return "⛔ 打开失败: %s" % exc
+
+        def online_home(self):
+            """dic online patch: 返回本地词典查询页"""
+            state["online"] = False
+            w = state.get("word") or ""
+
+            def _go():
+                try:
+                    window.load_html(_entry_page(
+                        w,
+                        '<script>(function w(){'
+                        'if(window.pywebview&&pywebview.api){'
+                        'try{doLookup();}catch(e){}}'
+                        'else{setTimeout(w,200);}})();</script>',
+                        OXFORD9_CSS,
+                        float(_load_cfg().get("zoom") or 1.0)))
+                except Exception:
+                    pass
+            _idle_call(_go)
+            return True
+
+        def open_external(self, idx):
+            """(dic stack patch) 用系统浏览器打开第 idx 个在线站点"""
+            try:
+                idx = int(idx)
+            except Exception:
+                idx = 0
+            urls = online_site_urls(state.get("last_query") or "")
+            if 0 <= idx < len(urls):
+                import webbrowser, threading
+                threading.Thread(
+                    target=lambda: webbrowser.open(urls[idx]),
+                    daemon=True).start()
+            return True
+
+        def devtools(self):
+            """(dic devtools patch) Ctrl+Shift+I: 显示/隐藏 WebKit 检查器"""
+            def _go():
+                wk = state.get("webkit")
+                if wk is None:
+                    return
+                try:
+                    wk.get_settings().props.enable_developer_extras = True
+                except Exception:
+                    pass
+                try:
+                    insp = wk.get_inspector()
+                    if state.get("devtools"):
+                        insp.close()
+                        state["devtools"] = False
+                    else:
+                        insp.show()
+                        state["devtools"] = True
+                except Exception:
+                    pass
+            _idle_call(_go)
+            return True
+
         def close(self):
             try:
                 webview.windows[0].destroy()
@@ -1626,7 +2054,7 @@ def run_gui_web(initial_text=None, auto_switch=True):
                         wk.set_zoom_level(float(level))
                     except Exception:
                         pass
-            _save_cfg_merged({"zoom": level})
+                _save_cfg_merged({"zoom": level})
             return True
 
     def _entry_page(word="", body="", css="", zoom=1.0):
@@ -1645,7 +2073,6 @@ def run_gui_web(initial_text=None, auto_switch=True):
     body = ""
     word0 = ""
     css0 = OXFORD9_CSS
-
     if initial and _is_single_word(initial):
         word0 = initial
         r = lookup(initial)
@@ -1653,10 +2080,15 @@ def run_gui_web(initial_text=None, auto_switch=True):
             state["mdx"] = r.get("_mdx")
             state["word"] = r.get("word")
             body = _prepare(r["_html"])
-            css0 = r.get("css", "") + "\n" + OXFORD9_CSS
+            css0 = _css_localize(r.get("css", "")) + "\n" + OXFORD9_CSS
             _dump(body, css0)
         else:
             body = "<p>%s</p>" % _esc(translate_text(initial))
+    elif initial:
+        # (dic stack patch) 非单词 -> 直接把拼接式在线词典作为初始内容
+        state["last_query"] = initial
+        state["online"] = False
+        body = _online_stacked_html(initial)
 
     # dic 恢复上次窗口尺寸/缩放 (dic cfg patch)
     _cfgd = _load_cfg()
@@ -1681,6 +2113,19 @@ def run_gui_web(initial_text=None, auto_switch=True):
         height=h0,
     )
 
+    # dic online patch: 远程词典页加载完后注入站点切换工具条
+    def _on_loaded():
+        if state.get("online"):
+            try:
+                window.evaluate_js(_online_inject_js(
+                    state.get("last_query") or ""))
+            except Exception:
+                pass
+    try:
+        window.events.loaded += _on_loaded
+    except Exception:
+        pass
+
     # pywebview 有原生窗口的情况下，直接挂 Qt Esc 兜底；
     # JS 同时也会处理 Esc，因此不同 backend 都能关闭。
     try:
@@ -1690,6 +2135,7 @@ def run_gui_web(initial_text=None, auto_switch=True):
     except Exception:
         pass
 
+    _register_dicres_scheme()
     webview.start(_native_hook, args=(window, state))
 
 
@@ -1697,91 +2143,89 @@ def run_cli(content):
     content = (content or "").strip()
     if not content:
         return 1
-
+    if not _is_single_word(content):
+        # dic online patch: 短语/句子 -> 弹出 WebView 在线词典窗口
+        print("🌐 非单词输入: 打开在线词典窗口…")
+        run_gui_web(initial_text=content, auto_switch=False)
+        return 0
     r = lookup(content)
     if not r["found"]:
         out = translate_text(content)
         print(out)
         return 0 if out else 1
-
     print(f"--- {r['dict']} | {r['word']}\n")
     print(r["text"])
-
     for variant in ("gb", "us"):
         path = get_playable(r["word"], variant)
         if path:
-            print(f" 🎧 {path}")
-
+            print(f"  🎧 {path}")
     return 0
 
 
 def main():
     args = sys.argv[1:]
-
     if not args:
-        print('用法: ./dic [-g] "<content>"', file=sys.stderr)
+        print('用法: ./dic [-g|-w|-t] "<content>"', file=sys.stderr)
         return 1
-
     if args[0] == "--native":
         content = " ".join(args[1:]).strip()
         if content:
             run_gui(initial_text=content, auto_switch=True)
         return 0
-
     if args[0] == "--web":
         content = " ".join(args[1:]).strip()
         if content:
             run_gui_web(initial_text=content, auto_switch=True)
         return 0
-
     if args[0] in ("-g", "--gui"):
         content = " ".join(args[1:]).strip()
         if not content:
             print('用法: ./dic -g "<content>"', file=sys.stderr)
             return 1
-
-        if _is_single_word(content):
-            run_gui_web(initial_text=content, auto_switch=True)
-        else:
-            run_gui(initial_text=content, auto_switch=True)
+        # 单词→本地词典, 短语/句子→在线词典, 均在 WebView 内
+        run_gui_web(initial_text=content, auto_switch=True)
         return 0
-
     if args[0] in ("-w", "--webview"):
         content = " ".join(args[1:]).strip()
         if not content:
-            print('用法: ./dic -w "<word>"', file=sys.stderr)
+            print('用法: ./dic -w "<content>"', file=sys.stderr)
             return 1
         run_gui_web(initial_text=content, auto_switch=False)
         return 0
-
     if args[0] in ("-t", "--text"):
         content = " ".join(args[1:]).strip()
         if not content:
             print('用法: ./dic -t "<content>"', file=sys.stderr)
             return 1
         return run_cli(content)
-
     if args[0] in ("-h", "--help"):
         print(
             '用法:\n'
-            '  ./dic "<content>"       自动判断 GUI\n'
-            '  ./dic -g "<content>"   自动判断 GUI\n'
-            '  ./dic -w "<word>"      强制 WebView\n'
-            '  ./dic -t "<content>"   命令行模式'
+            '  ./dic "<content>"   单词→WebView 本地词典; 短语/句子→WebView 在线词典\n'
+            '  ./dic -g "<content>" 同上\n'
+            '  ./dic -w "<content>" 强制 WebView (不做自动切换)\n'
+            '  ./dic -t "<content>" 命令行模式 (短语时弹 WebView 在线词典窗口)\n'
+            '  ./dic --native "<content>" 强制原生 Qt 窗口'
         )
         return 0
-
     content = " ".join(args).strip()
     if not content:
         return 1
-
-    if _is_single_word(content):
-        run_gui_web(initial_text=content, auto_switch=True)
-    else:
-        run_gui(initial_text=content, auto_switch=True)
-
+    # 单词→本地词典, 短语/句子→在线词典, 均在 WebView 内
+    run_gui_web(initial_text=content, auto_switch=True)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback as _tb
+        try:
+            with open("/tmp/dic-crash.log", "a", encoding="utf-8") as _f:
+                _f.write(time.strftime("[%F %T] ") + _tb.format_exc() + "\n")
+        except Exception:
+            pass
+        raise
