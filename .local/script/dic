@@ -23,7 +23,7 @@ dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译 + WebV
 # pip: pip3 install --user 'pywebview>=4' PySide6 FreeSimpleGUI FreeSimpleGUIQt mdict-mquery
 #   (报 externally-managed-environment 加 --break-system-packages)
 # 音频: mpv / ffplay / cvlc / paplay 任一即可
-# 离线词典: goldendict 的百度网盘 dicts/Oxford9 移到 ~/.local/share/golden-dict/Oxford
+# 离线词典: https://github.com/yanyingwang/goldendict 的百度网盘 dicts/Oxford9 移到 ~/.local/share/golden-dict/Oxford
 """
 
 import sys, os, re, glob, shutil, sqlite3, platform, subprocess
