@@ -6,12 +6,53 @@ dic — 单文件整合版（GUI + CLI + 本地词典 + Bing 在线翻译）
 用法:
   ./dic                 启动 GUI（启动时读取一次划选内容并翻译，之后手动输入回车翻译）
   ./dic -t "<content>"  命令行查词/翻译
-  在系统自定义快捷键, 命令项输入: bash -lc '$HOME/.local/script/dic "$(/usr/bin/wl-paste -n -p)"'
+    在系统自定义快捷键, 命令项输入: bash -lc '$HOME/.local/script/dic "$(/usr/bin/wl-paste -n -p)"'
   
-依赖:
-  sudo dnf install lzo-devel gcc python3-devel
-  pip install requests lxml python-lzo mdict-mquery FreeSimpleGUIQt
-  （FreeSimpleGUIQt 缺失时自动回退 Tk 版 FreeSimpleGUI）
+  
+# ============================================================
+# 依赖安装说明 (Linux / deb + dnf)
+# ============================================================
+
+# 1) 系统包
+# Fedora / RHEL 系:
+sudo dnf install python3-lxml python3-gobject gtk3 webkit2gtk4.1 \
+     python3-requests python3-tkinter \
+     google-noto-sans-cjk-ttc-fonts pulseaudio-utils
+
+# Debian / Ubuntu 系:
+sudo apt install python3-lxml python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 \
+     python3-requests python3-tk \
+     fonts-noto-cjk pulseaudio-utils
+
+#   注 1: 老发行版 (Fedora < 38 / Ubuntu 22.04 / Debian 11) 把 webkit2gtk4.1
+#         (gir1.2-webkit2-4.1) 换成 ...4.0
+#   注 2: CJK 字体不装的话中文全变豆腐块, 别误判成词典坏了
+
+# 2) pip 包 (仓库里没有或版本太旧的)
+pip3 install --user 'pywebview>=4' PySide6 FreeSimpleGUI FreeSimpleGUIQt mdict-mquery
+#   Fedora 38+ / Ubuntu 23.04+ 报 externally-managed-environment 的话加:
+#   --break-system-packages
+
+# 3) 音频播放器 (脚本按 mpv → ffplay → cvlc → paplay 顺序回退,
+#    至少装一个即可; 都装也行)
+sudo apt install mpv          # deb 系 (官方仓库)
+sudo dnf install mpv          # dnf 系: mpv/ffmpeg 在 RPM Fusion, 需先:
+#     sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+#   不想动 RPM Fusion 的话, pulseaudio-utils (paplay) 已在第 1 步装好, 兜底够用
+
+# 4) 离线词典
+下载 https://github.com/yanyingwang/goldendict 提供的百度网盘的 dicts/Oxford9 移动为 $HOME/.local/share/golden-dict/Oxford
+
+# 5) 验证
+python3 - <<'EOF'
+import lxml.html, requests, webview, mdict_mquery, FreeSimpleGUI
+import PySide6, FreeSimpleGUIQt
+import gi; gi.require_version('Gtk', '3.0')
+print("✅ python 依赖 OK")
+EOF
+fc-list :lang=zh | head -3     # 有输出 = 中文字体在
+~/.local/script/dic -w test    # 开窗 + 中文显示 + 点喇叭有声 = 全部就绪
+
 """
 import sys, os, re, glob, shutil, sqlite3, platform, subprocess
 import time
