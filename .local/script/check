@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""
+check <file>
+    检查 <file> 同目录下是否存在 <file>.sha256：
+      - 存在   -> 调用 sha256sum -c <file>.sha256
+      - 不存在 -> 提示并询问是否生成校验文件
+"""
+
+import hashlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CHUNK_SIZE = 1 << 20  # 1 MiB
+
+
+def sha256_of(path: Path) -> str:
+    """计算文件的 SHA-256 十六进制摘要。"""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_checksum_file(target: Path) -> Path:
+    """生成 <file>.sha256，格式与 sha256sum 输出一致。"""
+    digest = sha256_of(target)
+    ck_file = target.with_name(target.name + ".sha256")
+    # 只写文件名（不含目录），这样在文件所在目录下执行 sha256sum -c 才能通过
+    ck_file.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
+    return ck_file
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print(f"用法: {Path(argv[0]).name} <file>", file=sys.stderr)
+        return 2
+
+    target = Path(argv[1])
+    if not target.is_file():
+        print(f"错误: 找不到文件: {target}", file=sys.stderr)
+        return 2
+
+    ck_file = target.with_name(target.name + ".sha256")
+
+    # ---------- 有校验文件：直接校验 ----------
+    if ck_file.is_file():
+        if shutil.which("sha256sum") is None:
+            print("错误: 系统中找不到 sha256sum 命令", file=sys.stderr)
+            return 2
+
+        print(f"找到校验文件: {ck_file}")
+        # 切到文件所在目录执行，保证校验文件里的相对文件名能对上
+        result = subprocess.run(
+            ["sha256sum", "-c", ck_file.name],
+            cwd=str(ck_file.parent),
+        )
+        return result.returncode
+
+    # ---------- 没有校验文件：询问是否生成 ----------
+    print(f"没有找到校验文件: {ck_file}")
+    try:
+        answer = input("是否生成校验文件? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+
+    if answer in ("y", "yes"):
+        try:
+            path = write_checksum_file(target)
+        except OSError as e:
+            print(f"错误: 生成校验文件失败: {e}", file=sys.stderr)
+            return 2
+        print(f"已生成: {path}")
+        print(f"  {path.read_text(encoding='utf-8').strip()}")
+        return 0
+
+    print("已取消，未生成校验文件。")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
