@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-termux - 自动发现局域网内开放的 Termux SSH 主机并生成 SSH 命令
-
-默认行为：解析并扫描后，把完整的 ssh 命令预填到终端（tmux 环境），
-或打印到 stdout（其他环境），不会自动执行。
+termux - 扫描局域网内的 Termux SSH 主机，打印并复制 ssh 命令到剪贴板
 
 用法:
   termux                  # 生成默认用户名的 ssh 命令
@@ -16,20 +13,14 @@ termux - 自动发现局域网内开放的 Termux SSH 主机并生成 SSH 命令
   -p, --port    SSH 端口           (默认 8022)
   -u, --user    默认用户名         (默认 u0_a123)
   -t, --timeout TCP 探测超时(秒)   (默认 1.0)
-  --print       只打印命令，不尝试预填
-
-配合 shell 函数使用（非 tmux 环境预填）:
-  # Bash:
-  termux() { local c; c=$(command termux "$@") || return; [ -n "$c" ] && read -e -i "$c" && eval "$REPLY"; }
-  # Zsh:
-  termux() { local c; c=$(command termux "$@") || return; [ -n "$c" ] && print -z "$c"; }
+  -n, --no-copy 只打印，不复制到剪贴板
 """
 
 from __future__ import annotations
 
 import ipaddress
-import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -42,7 +33,7 @@ DEFAULT_TIMEOUT = 1.0
 WORKERS = 128
 
 
-def is_open(ip: str, port: int, timeout: float):
+def is_open(ip, port, timeout):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return ip
@@ -50,7 +41,7 @@ def is_open(ip: str, port: int, timeout: float):
         return None
 
 
-def scan(cidr: str, port: int, timeout: float):
+def scan(cidr, port, timeout):
     net = ipaddress.ip_network(cidr, strict=False)
     hosts = [str(h) for h in net.hosts()]
     found = []
@@ -64,7 +55,7 @@ def scan(cidr: str, port: int, timeout: float):
     return found
 
 
-def resolve_user(arg, default_user: str) -> str:
+def resolve_user(arg, default_user):
     if arg is None:
         return default_user
     if arg.isdigit():
@@ -72,34 +63,36 @@ def resolve_user(arg, default_user: str) -> str:
     return arg
 
 
-def build_ssh_command(user: str, ip: str, port: int, remote_cmd):
+def build_ssh_command(user, ip, port, remote_cmd):
     parts = [
-        "ssh",
-        "-p", str(port),
+        "ssh", "-p", str(port),
         "-o", "StrictHostKeyChecking=accept-new",
         f"{user}@{ip}",
     ]
-    if remote_cmd:
-        parts += [shlex.quote(c) for c in remote_cmd]
+    parts += [shlex.quote(c) for c in remote_cmd]
     return " ".join(parts)
 
 
-def try_prefill_tmux(cmd: str) -> bool:
-    """在 tmux 环境下把命令预填到当前 pane（不按回车）。"""
-    pane = os.environ.get("TMUX_PANE")
-    if not pane:
-        return False
-    try:
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane, "-l", cmd],
-            check=True,
-        )
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+def copy_to_clipboard(text):
+    """把 text 复制到系统剪贴板。返回使用的工具名，失败返回 None。"""
+    candidates = [
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("xsel", ["xsel", "--clipboard", "--input"]),
+        ("pbcopy", ["pbcopy"]),
+    ]
+    for name, cmd in candidates:
+        if not shutil.which(name):
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode(), check=True)
+            return name
+        except subprocess.CalledProcessError:
+            continue
+    return None
 
 
-def print_help() -> None:
+def print_help():
     print(__doc__.strip())
 
 
@@ -110,7 +103,7 @@ def parse_args(argv):
     timeout = DEFAULT_TIMEOUT
     target = None
     command = []
-    force_print = False
+    no_copy = False
 
     i = 0
     while i < len(argv):
@@ -118,9 +111,8 @@ def parse_args(argv):
         if a in ("-h", "--help"):
             print_help()
             sys.exit(0)
-        elif a == "--print":
-            force_print = True
-            i += 1
+        elif a in ("-n", "--no-copy"):
+            no_copy = True; i += 1
         elif a in ("-c", "--cidr"):
             cidr = argv[i + 1]; i += 2
         elif a in ("-p", "--port"):
@@ -133,11 +125,11 @@ def parse_args(argv):
             target = a
             command = argv[i + 1:]
             break
-    return cidr, port, user, timeout, target, command, force_print
+    return cidr, port, user, timeout, target, command, no_copy
 
 
-def main() -> int:
-    cidr, port, default_user, timeout, target, command, force_print = parse_args(sys.argv[1:])
+def main():
+    cidr, port, default_user, timeout, target, command, no_copy = parse_args(sys.argv[1:])
     user = resolve_user(target, default_user)
 
     print(f"[termux] 扫描 {cidr} 端口 {port} ...", file=sys.stderr)
@@ -148,19 +140,23 @@ def main() -> int:
         return 1
 
     print(f"[termux] 发现 {len(ips)} 台候选: {', '.join(ips)}", file=sys.stderr)
-
     ip = ips[0]
     if len(ips) > 1:
         print(f"[termux] 选择第一台: {ip}", file=sys.stderr)
 
     cmd = build_ssh_command(user, ip, port, command)
 
-    if not force_print and try_prefill_tmux(cmd):
-        print("[termux] 已预填到终端，按回车执行", file=sys.stderr)
+    print(cmd)
+
+    if no_copy:
         return 0
 
-    # 非 tmux：把命令打印到 stdout，方便 shell 函数捕获
-    print(cmd)
+    tool = copy_to_clipboard(cmd)
+    if tool:
+        print(f"[termux] 已复制到剪贴板 ({tool})，直接粘贴执行即可", file=sys.stderr)
+    else:
+        print("[termux] 未找到剪贴板工具 (wl-copy/xclip/xsel/pbcopy)，仅打印", file=sys.stderr)
+
     return 0
 
 
