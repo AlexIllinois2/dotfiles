@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+termux - 自动发现局域网内开放的 Termux SSH 主机并连接
+
+用法:
+  termux                  # 用默认用户名连接
+  termux 456              # 连接 u0_a456@<IP>
+  termux u10_a456         # 直接指定完整用户名
+  termux 456 ls -la       # 连上后在手机执行命令
+
+选项:
+  -c, --cidr    扫描网段           (默认 192.168.1.0/24)
+  -p, --port    SSH 端口           (默认 8022)
+  -u, --user    默认用户名         (默认 u0_a123)
+  -t, --timeout TCP 探测超时(秒)   (默认 1.0)
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import socket
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+DEFAULT_CIDR = "192.168.1.0/24"
+DEFAULT_PORT = 8022
+DEFAULT_USER = "u0_a123"
+DEFAULT_TIMEOUT = 1.0
+WORKERS = 128
+SSH_CONNECT_TIMEOUT = 5
+
+
+def is_open(ip: str, port: int, timeout: float):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return ip
+    except OSError:
+        return None
+
+
+def scan(cidr: str, port: int, timeout: float):
+    net = ipaddress.ip_network(cidr, strict=False)
+    hosts = [str(h) for h in net.hosts()]
+    found = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(is_open, ip, port, timeout): ip for ip in hosts}
+        for f in as_completed(futs):
+            r = f.result()
+            if r:
+                found.append(r)
+    found.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+    return found
+
+
+def resolve_user(arg, default_user: str) -> str:
+    if arg is None:
+        return default_user
+    if arg.isdigit():
+        return f"u0_a{arg}"
+    return arg
+
+
+def ssh_connect(user: str, ip: str, port: int, remote_cmd):
+    cmd = [
+        "ssh",
+        "-p", str(port),
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o", "StrictHostKeyChecking=accept-new",
+        f"{user}@{ip}",
+    ]
+    if remote_cmd:
+        cmd += remote_cmd
+    print(f"[termux] ssh {user}@{ip}:{port}", file=sys.stderr)
+    try:
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        print("[termux] 找不到 ssh 命令，请先安装 OpenSSH 客户端", file=sys.stderr)
+        return 127
+
+
+def print_help() -> None:
+    print(__doc__.strip())
+
+
+def parse_args(argv):
+    cidr = DEFAULT_CIDR
+    port = DEFAULT_PORT
+    user = DEFAULT_USER
+    timeout = DEFAULT_TIMEOUT
+    target = None
+    command = []
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif a in ("-c", "--cidr"):
+            cidr = argv[i + 1]; i += 2
+        elif a in ("-p", "--port"):
+            port = int(argv[i + 1]); i += 2
+        elif a in ("-u", "--user"):
+            user = argv[i + 1]; i += 2
+        elif a in ("-t", "--timeout"):
+            timeout = float(argv[i + 1]); i += 2
+        else:
+            target = a
+            command = argv[i + 1:]
+            break
+    return cidr, port, user, timeout, target, command
+
+
+def main() -> int:
+    cidr, port, default_user, timeout, target, command = parse_args(sys.argv[1:])
+    user = resolve_user(target, default_user)
+
+    print(f"[termux] 扫描 {cidr} 端口 {port} ...", file=sys.stderr)
+    ips = scan(cidr, port, timeout)
+
+    if not ips:
+        print("[termux] 没有找到开放该端口的主机", file=sys.stderr)
+        return 1
+
+    print(f"[termux] 发现 {len(ips)} 台候选: {', '.join(ips)}", file=sys.stderr)
+
+    for ip in ips:
+        rc = ssh_connect(user, ip, port, command)
+        if rc == 0:
+            return 0
+        print(f"[termux] {ip} 连接失败 (rc={rc})，尝试下一个", file=sys.stderr)
+
+    print("[termux] 所有候选都连接失败", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
