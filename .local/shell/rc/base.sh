@@ -1,9 +1,3 @@
-# cd
-alias ~="cd $HOME"
-alias ..="cd ../"
-alias ...="cd ../../"
-alias ....="cd ../../../"
-alias .....="cd ../../../../"
 
 # ls
 alias ls="eza --color=auto"
@@ -11,6 +5,14 @@ alias la="ls -a"
 alias l="ls -l"
 alias lla="ls -al"
 alias lt="ls --tree"
+
+# cd
+alias ~="cd $HOME"
+alias ..="cd ../"
+alias ...="cd ../../"
+alias ....="cd ../../../"
+alias .....="cd ../../../../"
+alias ......="cd ../../../../../"
 
 alias grep="grep --color=auto"
 
