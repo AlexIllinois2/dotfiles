@@ -4,7 +4,7 @@
 arc.py —— 自动压缩 / 解压脚本 (需 Python 3.8+)
 
 用法:
-  arc.py [-l/--list] [-i/--input] <输入路径> [-o/--output <输出路径>]
+  arc.py [-l/--list] [-t/--test] [-i/--input] <输入路径> [-o/--output <输出路径>]
          [-c/--compress-level <压缩率>] [-v/--volume <单卷大小>]
          [-p/--password <密码>] [成员...]
   arc.py -h/--help
@@ -13,10 +13,11 @@ arc.py —— 自动压缩 / 解压脚本 (需 Python 3.8+)
   -i, --input <输入路径>          输入路径 (也可省略参数名, 直接写位置参数)
   -o, --output <输出路径>         输出路径 (压缩=输出文件, 解压=输出目录)
   -l, --list                      仅列出压缩包内容, 不做解压
+  -t, --test                      校验压缩包完整性
   -c, --compress-level <压缩率>   0~9 或别名(存储/最快/快速/标准/最大), 默认 3 (快速压缩)
   -v, --volume <单卷大小>         分卷压缩: 每卷大小, 如 100m / 4g / 650m
                                   (仅支持 7z 格式; 给了 -v 未给 -o 时默认输出 <name>.7z;
-                                   解压/查看时忽略)
+                                   解压/查看/校验时忽略)
   -p, --password [密码]           密码加密 (仅 7z / zip 压缩支持; rar 仅解压)
                                   -p 不带值时交互输入; 其余格式会明确报错
   成员...                         仅解压压缩包中的指定成员 (支持 * ? [] 通配符;
@@ -26,19 +27,27 @@ arc.py —— 自动压缩 / 解压脚本 (需 Python 3.8+)
 注意:
   7z 推荐 -mhe=on 加密文件名;
   zip 走 Info-ZIP 的 ZipCrypto 弱加密且文件名明文, 敏感数据请用 7z
-  rar 为专有格式: 仅支持解压/查看, 且必须使用 unrar (不会回退到 7z)
+  rar 为专有格式: 仅支持解压/查看/校验, 且必须使用 unrar (不会回退到 7z)
+
+  -t/--test 校验压缩包完整性:
+    zip 逐项读取并校验 CRC-32 (AES 加密的 zip 自动回退到 7z 测试);
+    tar / tar.gz / tar.bz2 / tar.xz 全量读取每个成员 (可发现截断/解压错误);
+    gz / bz2 / xz 流式全解 (可发现流截断/损坏);
+    7z / rar 调用外部 `7z t` / `unrar t`;
+    分卷 7z 传 .001 卷即可, 由 7z 自动找齐所有卷并校验;
+    加密包若未给 -p 会交互提示输入。
 
 -h, --help 显示帮助
-(兼容旧版中文别名: -输入 / -输出 / -仅查看 / -压缩率 / -卷大小 / -密码)
+(兼容旧版中文别名: -输入 / -输出 / -仅查看 / -校验 / -压缩率 / -卷大小 / -密码)
 
 规则:
 * 自动判断方向: 输入是目录、或不带可识别压缩后缀的文件 => 压缩;
-  输入是可识别的压缩包(后缀或文件头) => 解压。
+  输入是可识别的压缩包(后缀或文件头) => 解压/查看/校验。
 * 未指定 -o 时: 压缩 => 当前目录生成 <name>.zip    解压 => 解到当前目录
   指定 -o 时:   压缩 => 按输出路径后缀选择格式      解压 => 作为解压根目录
 * 分卷压缩 (仅 7z): 使用 7z 原生 -v 开关, 压缩器边压边切, 单遍完成, 无临时整包;
   生成 <输出>.001 ... <输出>.NNN; 其余格式不支持原生分卷压缩, 会明确报错提示。
-* 分卷解压/查看 (7z): 输入任一分卷 <xxx>.7z.<编号> 即可
+* 分卷解压/查看/校验 (7z): 输入任一分卷 <xxx>.7z.<编号> 即可
   (也可直接写基础名 <xxx>.7z, 只要同目录存在 .001), 由 7z 自动找齐所有卷并校验完整性,
   缺卷时 7z 报错。
 * 密码加密 (7z): AES-256 + -mhe=on 头加密 (文件名同样加密), 可与 -v 分卷叠加;
@@ -52,7 +61,7 @@ arc.py —— 自动压缩 / 解压脚本 (需 Python 3.8+)
 
 支持格式:
   zip / tar / tar.gz / tar.bz2 / tar.xz / gz / bz2 / xz (标准库),
-  7z 需系统安装 7z; rar 仅支持解压/查看且必须使用 unrar。
+  7z 需系统安装 7z; rar 仅支持解压/查看/校验且必须使用 unrar。
   分卷压缩仅支持 7z; 密码加密仅支持 7z (推荐) 与 zip (弱加密)。
 """
 
@@ -73,7 +82,7 @@ import time
 import zipfile
 from pathlib import Path
 
-VERSION = '1.7'
+VERSION = '1.8'
 CHUNK = 4 * 1024 * 1024          # 流式读写块大小
 DEFAULT_LEVEL = 3                # 未指定压缩率时: 快速档
 
@@ -650,7 +659,7 @@ def _check_tar_members(members, target):
                 raise ArcError('检测到不安全链接: %s -> %s' % (m.name, m.linkname))
         if m.isdev():
             raise ArcError('拒绝解压设备文件: %s' % m.name)
-            
+
 
 def prompt_password(hint=''):
     """交互式询问密码, 最多 3 次, 空密码/中断返回 None"""
@@ -665,7 +674,6 @@ def prompt_password(hint=''):
             return pwd
         print('密码不能为空', file=sys.stderr)
     return None
-
 
 
 def extract_tar(archive, output_dir, stem, members=None):
@@ -900,6 +908,147 @@ def do_list(archive: Path, fmt, password=None):
     return 0
 
 
+# ---------------- 校验 (test) ----------------
+
+def test_zip(archive, password=None):
+    """逐项读取 zip, 校验 CRC-32。AES 加密回退到 7z。"""
+    with zipfile.ZipFile(archive) as zf:
+        infos = zf.infolist()
+        encrypted = any(i.flag_bits & 0x1 or i.compress_type == 99 for i in infos)
+        if encrypted and not password:
+            LOG.debug('检测到加密 zip, 未提供密码, 交互输入')
+            password = prompt_password()
+            if password is None:
+                raise ArcError('未提供密码, 无法校验加密 zip (可用 -p/--密码 指定)')
+        if password and any(i.compress_type == 99 for i in infos):
+            LOG.debug('检测到 AES 加密 zip, 回退到 7z 工具校验')
+            return test_external(archive, '7z', password)
+
+        pwd = password.encode('utf-8') if password else None
+        total = sum(i.file_size for i in infos)
+        for n, info in enumerate(infos, 1):
+            if info.is_dir():
+                continue
+            LOG.debug('[%d/%d] 校验 %s (%s)', n, len(infos),
+                      info.filename, human_size(info.file_size))
+            try:
+                with zf.open(info, 'r', pwd=pwd) as f:
+                    while f.read(CHUNK):
+                        pass
+            except RuntimeError as e:
+                if 'password' in str(e).lower() and encrypted:
+                    LOG.debug('密码校验失败, 请重试')
+                    retry = prompt_password('上一次密码错误')
+                    if retry:
+                        return test_zip(archive, retry)
+                raise ArcError('校验失败: %s' % e)
+            except zipfile.BadZipFile as e:
+                raise ArcError('校验失败, 损坏成员 %s: %s' % (info.filename, e))
+        return len(infos), total
+
+
+def test_tar(archive):
+    """tar 无每成员校验和, 但全量读取可发现截断/解压错误。"""
+    with tarfile.open(archive, 'r:*') as tf:
+        members = tf.getmembers()
+        total = 0
+        for n, m in enumerate(members, 1):
+            if not m.isfile():
+                LOG.debug('[%d/%d] 跳过非文件项 %s (%s)',
+                          n, len(members), m.name, tar_kind(m))
+                continue
+            LOG.debug('[%d/%d] 校验 %s (%s)', n, len(members),
+                      m.name, human_size(m.size))
+            f = tf.extractfile(m)
+            if f is None:
+                raise ArcError('无法读取成员: %s' % m.name)
+            try:
+                while f.read(CHUNK):
+                    pass
+            except (tarfile.TarError, EOFError, OSError) as e:
+                raise ArcError('校验失败, 损坏成员 %s: %s' % (m.name, e))
+            total += m.size
+        return len(members), total
+
+
+def test_single(archive, fmt):
+    """gz/bz2/xz: 流式全解, 校验流完整性。"""
+    opener = {'gz': gzip.open, 'bz2': bz2.open, 'xz': lzma.open}[fmt]
+    size = 0
+    try:
+        with opener(archive, 'rb') as f:
+            while True:
+                c = f.read(CHUNK)
+                if not c:
+                    break
+                size += len(c)
+    except (OSError, EOFError) as e:
+        raise ArcError('校验失败: %s' % e)
+    return 1, size
+
+
+def test_external(archive, fmt, password=None):
+    """7z/rar: 调用外部工具的 t 命令。rar 强制 unrar。"""
+    if fmt == 'rar':
+        tool = find_tool(('unrar',),
+                         'rar 为专有格式, 仅支持用 unrar 解压/查看/校验, '
+                         '请安装 unrar (如: apt install unrar)')
+        cmd = [tool, 't', str(archive)]
+        if password:
+            cmd.insert(2, '-p' + password)
+    else:
+        tool = find_tool(('7z', '7za', '7zr'))
+        cmd = [tool, 't', '-bd', '--', str(archive)]
+        if password:
+            cmd.insert(2, '-p' + password)
+
+    display = None
+    if password:
+        display = [('-p***' if str(c).startswith('-p') and len(str(c)) > 2 else c)
+                   for c in cmd]
+    LOG.debug('执行: %s', mask_cmd(display or cmd))
+
+    res = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    for line in (res.stdout or '').splitlines():
+        if line.strip():
+            LOG.debug('[工具] %s', line.rstrip())
+    for line in (res.stderr or '').splitlines():
+        if line.strip():
+            LOG.debug('[工具] %s', line.rstrip())
+
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or '').strip()
+        low = err.lower()
+        if password and ('wrong password' in low
+                         or 'password is incorrect' in low
+                         or 'cannot open encrypted' in low):
+            raise ArcError('校验失败: 密码错误或未提供 (-p/--密码)')
+        raise ArcError('校验失败(退出码 %d): %s'
+                       % (res.returncode, err or '未知错误'))
+    return None, None
+
+
+def do_test(archive: Path, fmt, password=None):
+    LOG.debug('开始校验: %s (格式 %s%s)', archive, fmt,
+              ', 密码' if password else '')
+    t0 = time.time()
+    if fmt == 'zip':
+        n, total = test_zip(archive, password)
+    elif fmt in TAR_FORMATS:
+        n, total = test_tar(archive)
+    elif fmt in SINGLE_FILE_FORMATS:
+        n, total = test_single(archive, fmt)
+    else:
+        n, total = test_external(archive, fmt, password)
+    LOG.debug('校验耗时 %s', fmt_elapsed(time.time() - t0))
+    if n is None:
+        LOG.info('校验通过: %s', archive)
+    else:
+        LOG.info('校验通过: %s (%d 项, 原始大小 %s)',
+                 archive, n, human_size(total))
+    return 0
+
+
 # ---------------- CLI ----------------
 
 def build_parser():
@@ -915,6 +1064,10 @@ def build_parser():
   arc.py big.iso.7z.001                # 自动识别分卷并完整解压 (缺卷时 7z 报错)
   arc.py secret.7z                     # 解压时提示输入密码
   arc.py -l secret.7z.002              # 只看分卷压缩包内容, 不解压
+  arc.py -t data.zip                   # 校验 zip 完整性 (逐项 CRC)
+  arc.py -t secret.7z -p               # 校验加密 7z, 交互输入密码
+  arc.py -t big.iso.7z.001             # 校验分卷 7z (传 001 卷即可)
+  arc.py -t bak.zip -p mypass          # 用指定密码校验加密 zip
   arc.py bak.zip 报告.docx data/img01.jpg   # 只解压 zip 里的指定文件 (保留包内路径)
   arc.py bak.tar.gz 'src/*.py'         # 解压 tar.gz 中匹配通配符的成员
   arc.py bak.7z notes.txt              # 从 7z (含分卷/加密) 只解出 notes.txt
@@ -922,11 +1075,19 @@ def build_parser():
 
     p = argparse.ArgumentParser(
         prog='arc.py',
-        description='自动压缩 / 解压脚本 (v%s)' % VERSION,
+        description='自动压缩 / 解压 / 校验脚本 (v%s)' % VERSION,
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('-l', '--list', '-仅查看', action='store_true', dest='list_only',
-                   help='仅列出压缩包内容, 不做解压')
+
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('-l', '--list', '-仅查看', action='store_true',
+                       dest='list_only',
+                       help='仅列出压缩包内容, 不做解压')
+    group.add_argument('-t', '--test', '-校验', action='store_true',
+                       dest='test_only',
+                       help='校验压缩包完整性: zip 校验 CRC-32; tar/流格式全量'
+                            '读取; 7z/rar 调外部 t 命令; 加密包用 -p 提供密码')
+
     p.add_argument('-i', '--input', '-输入', dest='input_opt', metavar='路径',
                    help='输入路径 (推荐直接写位置参数)')
     p.add_argument('-o', '--output', '-输出', dest='output', metavar='路径',
@@ -938,13 +1099,13 @@ def build_parser():
     p.add_argument('-v', '--volume', '-卷大小', dest='volume',
                    type=parse_volume_size, metavar='大小',
                    help='分卷压缩: 每卷大小, 如 100m / 4g / 650m '
-                        '(仅支持 7z 格式, 7z 原生分卷单遍完成); 解压/查看时忽略')
+                        '(仅支持 7z 格式, 7z 原生分卷单遍完成); 解压/查看/校验时忽略')
     p.add_argument('-p', '--password', '-密码', dest='password', nargs='?',
                    const='', metavar='密码',
                    help='密码加密 (仅 7z / zip 压缩支持; rar 仅解压); '
                         '-p 不带值时交互输入; 其余格式报错')
     p.add_argument('input_path', nargs='?', metavar='输入路径',
-                   help='输入文件或目录; 是压缩包(含 7z 分卷)则触发解压')
+                   help='输入文件或目录; 是压缩包(含 7z 分卷)则触发解压/查看/校验')
     p.add_argument('members', nargs='*', metavar='成员',
                    help='仅解压指定成员 (支持 * ? [] 通配符; 模式不含 / 时'
                         '匹配任意层级的文件名); 只对压缩包输入有效, 压缩时不允许')
@@ -997,7 +1158,7 @@ def main(argv=None):
     if input_path.is_file():
         volume_start = find_7z_volume(input_path)
 
-    # ---- 自动判断压缩 / 解压 ----
+    # ---- 自动判断压缩 / 解压 / 查看 / 校验 ----
     if volume_start is not None:
         fmt = '7z'   # 分卷包交给 7z 处理
     else:
@@ -1009,7 +1170,18 @@ def main(argv=None):
 
     try:
         if fmt is not None:
-            # 是压缩包 => 解压 / 查看
+            # 是压缩包 => 校验 / 查看 / 解压
+            if args.test_only:
+                if args.level is not None:
+                    LOG.debug('提示: 校验时 --compress-level 参数被忽略')
+                if args.volume:
+                    LOG.debug('提示: 校验时 --volume 参数被忽略')
+                if args.members:
+                    LOG.debug('提示: 校验时成员参数被忽略')
+                if args.output:
+                    LOG.debug('提示: 校验时 --output 参数被忽略')
+                return do_test(volume_start or input_path, fmt, args.password)
+
             if args.list_only:
                 if args.volume:
                     LOG.debug('提示: 查看/解压时 --volume 参数被忽略')
@@ -1019,18 +1191,23 @@ def main(argv=None):
                     LOG.debug('提示: 7z 未加密文件名时无需密码; '
                               '启用了 -mhe 头加密则需 -p 提供密码')
                 return do_list(volume_start or input_path, fmt, args.password)
+
             if args.level is not None:
                 LOG.debug('提示: 解压时 --compress-level 参数被忽略')
             if args.volume:
                 LOG.debug('提示: 解压时 --volume 参数被忽略')
             if fmt == 'rar':
-                LOG.debug('提示: rar 为专有格式, 解压/查看均强制使用 unrar')
+                LOG.debug('提示: rar 为专有格式, 解压/查看/校验均强制使用 unrar')
             return do_decompress(volume_start or input_path, args.output,
                                  fmt, args.password, args.members or None)
         else:
             # 否则 => 压缩
             if args.list_only:
                 print('错误: -l/--list 只对压缩包有效, 输入不是可识别的压缩包',
+                      file=sys.stderr)
+                return 2
+            if args.test_only:
+                print('错误: -t/--test 只对压缩包有效, 输入不是可识别的压缩包',
                       file=sys.stderr)
                 return 2
             if args.members:
@@ -1052,4 +1229,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
-
