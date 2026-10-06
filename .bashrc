@@ -7,11 +7,11 @@ fi
 
 # 基础插件
 source -- ~/.local/share/blesh/ble.sh
-source ~/.local/share/bash/fzf-tab-completion/bash/fzf-bash-completion.sh
+source ~/.local/share/bash/fzf-tab-completion.git/bash/fzf-bash-completion.sh
 # 将 Tab 键绑定到 fzf 补全功能
 bind -x '"\t": fzf_bash_completion'
 # 添加钩子供自定义脚本使用
-source ~/.local/share/bash/bash-preexec/bash-preexec.sh
+source ~/.local/share/bash/bash-preexec.git/bash-preexec.sh
 
 # 将上箭头绑定到向后搜索历史记录
 bind '"\e[A": history-search-backward'

@@ -79,8 +79,7 @@ git_hook_chpwd
 # chpwd钩子
 if [ -n "$ZSH_VERSION" ]; then
     if [[ -z ${chpwd_functions[(r)git_hook_chpwd]} ]]; then
-        #add-zsh-hook -Uz chpwd() { git_hook_chpwd }
-        add-zsh-hook chpwd git_hook_chpwd
+        add-zsh-hook -Uz chpwd() { git_hook_chpwd }
     fi
 elif [ -n "$BASH_VERSION" ]; then
     __last_pwd="$PWD"
