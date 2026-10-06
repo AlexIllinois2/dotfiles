@@ -76,8 +76,24 @@ git_hook_chpwd() {
     fi
 }
 git_hook_chpwd
-autoload -U add-zsh-hook
-add-zsh-hook -Uz chpwd() { git_hook_chpwd }
+# chpwd钩子
+if [ -n "$ZSH_VERSION" ]; then
+    if [[ -z ${chpwd_functions[(r)git_hook_chpwd]} ]]; then
+        #add-zsh-hook -Uz chpwd() { git_hook_chpwd }
+        add-zsh-hook chpwd git_hook_chpwd
+    fi
+elif [ -n "$BASH_VERSION" ]; then
+    __last_pwd="$PWD"
+    __chpwd_dispatch() {
+        if [[ "$PWD" != "$__last_pwd" ]]; then
+            __last_pwd="$PWD"
+            git_hook_chpwd
+        fi
+    }
+    if [[ ! " ${precmd_functions[*]} " == *" __chpwd_dispatch "* ]]; then
+        precmd_functions+=(__chpwd_dispatch)
+    fi
+fi
 
 # 使用git init的目录别名不生效时除了新开terminal也可以`.`一下(cd ./)
 git_init_process() {

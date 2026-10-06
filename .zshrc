@@ -65,9 +65,11 @@ zle -N clear-screen-and-scrollback
 # 绑定到 Ctrl+L（覆盖默认）
 bindkey '^L' clear-screen-and-scrollback
 
+# 添加钩子供自定义脚本使用
+autoload -U add-zsh-hook
+
 ## ---------- 自定义可加载的脚本 ----------
 find $HOME/.local/shell/env -mindepth 1 | while read line; do source "$line"; done
 find $HOME/.local/shell/rc -mindepth 1 | while read line; do source "$line"; done
 unset line
-
 
