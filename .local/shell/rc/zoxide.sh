@@ -8,3 +8,12 @@ fi
 cd() {
     __zoxide_z "$@" && ls -a
 }
+cd .
+
+# cd
+alias ~="cd $HOME"
+alias ..="cd ../"
+alias ...="cd ../../"
+alias ....="cd ../../../"
+alias .....="cd ../../../../"
+alias ......="cd ../../../../../"
