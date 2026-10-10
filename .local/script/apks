@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="一键 adb 安装当前目录下所有 APK（不递归）"
+    )
+    parser.add_argument(
+        "-s", "--serial",
+        help="指定设备序列号，例如 adb devices 中显示的序列号"
+    )
+    parser.add_argument(
+        "--adb",
+        default="adb",
+        help="adb 可执行文件路径，默认使用 PATH 中的 adb"
+    )
+    parser.add_argument(
+        "-d", "--allow-downgrade",
+        action="store_true",
+        help="允许降级安装，对应 adb install -d"
+    )
+    parser.add_argument(
+        "-t", "--test",
+        action="store_true",
+        help="允许安装 test 包，对应 adb install -t"
+    )
+    args = parser.parse_args()
+
+    cwd = Path.cwd()
+
+    # 只扫描当前目录，不递归；兼容 .apk / .APK
+    apks = sorted(
+        (
+            p for p in cwd.iterdir()
+            if p.is_file() and p.suffix.lower() == ".apk"
+        ),
+        key=lambda p: p.name.lower()
+    )
+
+    if not apks:
+        print(f"当前目录没有 APK 文件：{cwd}")
+        return 1
+
+    # 检查 adb 是否可用
+    try:
+        r = subprocess.run(
+            [args.adb, "version"],
+            capture_output=True,
+            text=True
+        )
+        if r.returncode != 0:
+            print(f"adb 不可用：{args.adb}")
+            print(r.stdout)
+            print(r.stderr)
+            return 1
+    except FileNotFoundError:
+        print(f"找不到 adb：{args.adb}，请确认已安装并加入 PATH。")
+        return 1
+
+    # 构造 adb 基础命令
+    base_cmd = [args.adb]
+    if args.serial:
+        base_cmd += ["-s", args.serial]
+
+    # 默认 -r：覆盖安装，保留数据
+    install_cmd = base_cmd + ["install", "-r"]
+    if args.allow_downgrade:
+        install_cmd.append("-d")
+    if args.test:
+        install_cmd.append("-t")
+
+    success = 0
+    failed = []
+    total = len(apks)
+
+    for idx, apk in enumerate(apks, 1):
+        print(f"[{idx}/{total}] 安装：{apk.name}")
+
+        r = subprocess.run(
+            install_cmd + [str(apk)],
+            capture_output=True,
+            text=True
+        )
+
+        output = ((r.stdout or "") + (r.stderr or "")).strip()
+
+        if r.returncode == 0 and "Success" in output:
+            print("  ✅ 成功")
+            success += 1
+        else:
+            print("  ❌ 失败")
+            if output:
+                for line in output.splitlines():
+                    print(f"     {line}")
+            failed.append(apk.name)
+
+    print(f"\n完成：成功 {success}/{total}")
+
+    if failed:
+        print("失败 APK：")
+        for name in failed:
+            print(f"  - {name}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
