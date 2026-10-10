@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="一键 adb 安装当前目录下所有 APK（不递归）"
+        description="一键 adb 安装当前目录下所有 APK（默认递归，可用 --no-recursive 关闭）"
     )
     parser.add_argument(
         "-s", "--serial",
@@ -30,21 +30,33 @@ def main() -> int:
         action="store_true",
         help="允许安装 test 包，对应 adb install -t"
     )
+    parser.add_argument(
+        "-n", "--no-recursive",
+        action="store_true",
+        help="不递归子目录，只安装当前目录下的 APK"
+    )
     args = parser.parse_args()
 
     cwd = Path.cwd()
 
-    # 只扫描当前目录，不递归；兼容 .apk / .APK
+    # 选择扫描方式：默认递归，-n 只扫描当前目录
+    if args.no_recursive:
+        candidates = cwd.iterdir()
+    else:
+        candidates = cwd.rglob("*")
+
+    # 过滤 APK 文件，兼容 .apk / .APK
     apks = sorted(
         (
-            p for p in cwd.iterdir()
+            p for p in candidates
             if p.is_file() and p.suffix.lower() == ".apk"
         ),
-        key=lambda p: p.name.lower()
+        key=lambda p: str(p.relative_to(cwd)).lower()
     )
 
     if not apks:
-        print(f"当前目录没有 APK 文件：{cwd}")
+        scope = "当前目录及子目录" if not args.no_recursive else "当前目录"
+        print(f"{scope}没有 APK 文件：{cwd}")
         return 1
 
     # 检查 adb 是否可用
@@ -80,7 +92,8 @@ def main() -> int:
     total = len(apks)
 
     for idx, apk in enumerate(apks, 1):
-        print(f"[{idx}/{total}] 安装：{apk.name}")
+        rel_path = apk.relative_to(cwd)
+        print(f"[{idx}/{total}] 安装：{rel_path}")
 
         r = subprocess.run(
             install_cmd + [str(apk)],
@@ -98,7 +111,7 @@ def main() -> int:
             if output:
                 for line in output.splitlines():
                     print(f"     {line}")
-            failed.append(apk.name)
+            failed.append(str(rel_path))
 
     print(f"\n完成：成功 {success}/{total}")
 
