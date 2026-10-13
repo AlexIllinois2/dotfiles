@@ -13,7 +13,7 @@ export EDITOR="vim"
 alias v="vim"
 alias nano="vim"
 
-alias dl='aria2c -x 8 -s 8 -c --file-allocation=none -d ~/Downloads'
+alias dl='aria2c -x 8 -s 8 -c --file-allocation=none -d ./'
 
 alias y="yadm"
 
