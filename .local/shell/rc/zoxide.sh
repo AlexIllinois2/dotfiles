@@ -1,4 +1,6 @@
 
+[[ -o interactive ]] || return
+
 if [ -n "$ZSH_VERSION" ]; then
     eval "$(zoxide init zsh --cmd cd)"
 elif [ -n "$BASH_VERSION" ]; then
